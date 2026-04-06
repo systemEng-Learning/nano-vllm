@@ -73,8 +73,8 @@ from nanovllm import LLM
 # Automatic detection from HuggingFace config
 llm = LLM(model="meta-llama/Llama-3-8B")
 
-# Or explicit model name
-llm = LLM(model="meta-llama/Llama-3-8B", model_name="llama")
+# Or explicit model architecture
+llm = LLM(model="meta-llama/Llama-3-8B", model_architecture="llama")
 ```
 
 ### Important Notes
@@ -150,7 +150,7 @@ from nanovllm import LLM
 
 llm = LLM(
     model="Qwen/Qwen-7B",
-    kv_cache_dtype="int8",  # Registry lookup by name
+    kvcache_type="int8",  # Registry lookup by name
 )
 ```
 
@@ -216,7 +216,7 @@ Or configure it in your model's attention layer:
 ```python
 class MyModelAttention(nn.Module):
     def __init__(self, config):
-        use_int8 = getattr(config, "kv_cache_dtype", "default") == "int8"
+        use_int8 = getattr(config, "kvcache_type", "default") == "int8"
         
         attn_backend = INT8FlashAttention() if use_int8 else None
         
@@ -254,7 +254,7 @@ nanovllm/
 ```python
 class MyModelAttention(nn.Module):
     def __init__(self, config):
-        cache_type = getattr(config, "kv_cache_dtype", "default")
+        cache_type = getattr(config, "kvcache_type", "default")
         
         # Auto-select matching backend
         if cache_type == "int8":
@@ -267,7 +267,7 @@ class MyModelAttention(nn.Module):
 
 **Usage:**
 ```python
-llm = LLM(model="Qwen/Qwen-7B", kv_cache_dtype="int8")
+llm = LLM(model="Qwen/Qwen-7B", kvcache_type="int8")
 ```
 
 This automatically uses:
@@ -286,7 +286,7 @@ This automatically uses:
 | **Implement** | `forward()`, `compute_logits()` |
 | **Register** | `@ModelRegistry.register("name", architectures=[...])` |
 | **Export** | Add to `nanovllm/models/__init__.py` |
-| **Use** | `LLM(model="...", model_name="name")` |
+| **Use** | `LLM(model="...", model_architecture="name")` |
 
 ### KV Caches
 | Step | Action |
@@ -296,7 +296,7 @@ This automatically uses:
 | **Implement** | `allocate()`, `store()`, `retrieve()` |
 | **Register** | `@KVCacheRegistry.register("name")` |
 | **Export** | Add to `nanovllm/kvcache/__init__.py` |
-| **Use** | `LLM(model="...", kv_cache_dtype="name")` |
+| **Use** | `LLM(model="...", kvcache_type="name")` |
 
 ### Attention Backends
 | Step | Action |

@@ -125,12 +125,16 @@ class ModelRunner:
         )
         block_bytes = temp_cache.get_cache_block_size_bytes()
         
-        # Calculate number of blocks per layer
+        # Count number of layers that need cache (for correct memory calculation)
+        num_cache_layers = hf_config.num_hidden_layers
+        
+        # Calculate number of blocks accounting for all layers
+        # Each layer gets its own cache, so divide by num_layers
         config.num_kvcache_blocks = int(
             total * config.gpu_memory_utilization - used - peak + current
-        ) // block_bytes
+        ) // (num_cache_layers * block_bytes)
         assert config.num_kvcache_blocks > 0, \
-            f"Not enough GPU memory for KV cache. Available: {total * config.gpu_memory_utilization - used - peak + current} bytes, needed per block: {block_bytes} bytes"
+            f"Not enough GPU memory for KV cache. Available: {total * config.gpu_memory_utilization - used - peak + current} bytes, needed per block: {block_bytes * num_cache_layers} bytes"
         
         # Create cache backends for each layer and allocate tensors
         layer_id = 0
@@ -146,11 +150,15 @@ class ModelRunner:
                 )
                 
                 # Let cache backend allocate its tensors
-                k_cache, v_cache = cache_backend.allocate()
+                # Handle both simple (k, v) and quantized (k, v, scales, ...) caches
+                cache_tensors = cache_backend.allocate()
+                k_cache, v_cache = cache_tensors[0], cache_tensors[1]
+                additional_tensors = cache_tensors[2:] if len(cache_tensors) > 2 else ()
                 
                 # Assign to module
                 module.k_cache = k_cache
                 module.v_cache = v_cache
+                module.additional_cache_tensors = additional_tensors
                 module.cache_backend = cache_backend
                 layer_id += 1
 

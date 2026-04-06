@@ -45,7 +45,18 @@ echo ""
 
 # Install core dependencies
 pip install -q --upgrade pip
-pip install -q torch>=2.4.0 transformers>=4.51.0 xxhash
+
+# Check if torch is already installed (e.g., in Colab with CUDA support)
+if python3 -c "import torch" 2>/dev/null; then
+    TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
+    echo "  ℹ PyTorch $TORCH_VERSION already installed, keeping existing installation..."
+    echo "    (To avoid replacing CUDA-enabled PyTorch with CPU version)"
+else
+    echo "  Installing PyTorch..."
+    pip install -q torch>=2.4.0
+fi
+
+pip install -q transformers>=4.51.0 xxhash
 
 # Install Triton (platform-specific)
 if [[ "$OSTYPE" == "darwin"* ]]; then
