@@ -26,6 +26,7 @@ class BaseFlashAttentionBackend(ABC):
         max_seqlen_k: Optional[int],
         cu_seqlens_k: Optional[torch.Tensor],
         block_table: Optional[torch.Tensor] = None,
+        *additional_cache_tensors,
     ) -> torch.Tensor:
         """
         Perform prefill attention (processing prompt tokens).
@@ -40,6 +41,7 @@ class BaseFlashAttentionBackend(ABC):
             max_seqlen_k: Maximum sequence length in the batch for keys
             cu_seqlens_k: Cumulative sequence lengths for keys
             block_table: Optional block table for prefix caching
+            *additional_cache_tensors: Optional metadata for quantized cache backends
             
         Returns:
             Output tensor [total_tokens, num_heads, head_dim]

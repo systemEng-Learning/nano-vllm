@@ -7,8 +7,8 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import ModelRegistry
-from nanovllm.models.qwen3 import Qwen3ForCausalLM  # Import to register
 from nanovllm.kvcache import KVCacheRegistry
+from nanovllm.layers.flash_attn_backend import FlashAttentionRegistry
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -37,6 +37,7 @@ class ModelRunner:
         
         # Create KV cache backend
         self.cache_backend_class = KVCacheRegistry.get_cache_class(config.kvcache_type)
+        self.attn_backend = self.create_attn_backend(config.kvcache_type)
         
         self.sampler = Sampler()
         self.warmup_model()
@@ -72,6 +73,12 @@ class ModelRunner:
             self.call(method_name, *args)
             if method_name == "exit":
                 break
+
+    def create_attn_backend(self, backend_name: str):
+        try:
+            return FlashAttentionRegistry.get(backend_name)()
+        except KeyError:
+            return FlashAttentionRegistry.get("default")()
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
@@ -160,6 +167,7 @@ class ModelRunner:
                 module.v_cache = v_cache
                 module.additional_cache_tensors = additional_tensors
                 module.cache_backend = cache_backend
+                module.attn_backend = self.attn_backend
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

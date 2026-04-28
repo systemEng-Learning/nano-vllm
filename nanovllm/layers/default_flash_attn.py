@@ -32,6 +32,7 @@ class DefaultFlashAttention(BaseFlashAttentionBackend):
         max_seqlen_k: Optional[int],
         cu_seqlens_k: Optional[torch.Tensor],
         block_table: Optional[torch.Tensor] = None,
+        *additional_cache_tensors,
     ) -> torch.Tensor:
         """
         Prefill attention using flash_attn_varlen_func.
@@ -53,6 +54,14 @@ class DefaultFlashAttention(BaseFlashAttentionBackend):
         Returns:
             Output [total_tokens, num_heads, head_dim]
         """
+        if k.dtype not in (torch.float16, torch.bfloat16) or v.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise NotImplementedError(
+                "DefaultFlashAttention only supports FP16/BF16 KV tensors. "
+                "Quantized KV caches require a custom attention backend."
+            )
         return flash_attn_varlen_func(
             q, k, v,
             max_seqlen_q=max_seqlen_q,
@@ -91,6 +100,15 @@ class DefaultFlashAttention(BaseFlashAttentionBackend):
         Returns:
             Output [batch_size, 1, num_heads, head_dim]
         """
+        if k_cache.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ) or v_cache.dtype not in (torch.float16, torch.bfloat16):
+            raise NotImplementedError(
+                "DefaultFlashAttention requires FP16/BF16 KV cache tensors for "
+                "flash_attn_with_kvcache. Quantized caches such as INT8/TurboQuant "
+                "still need dequantization or a quantized-aware attention backend."
+            )
         # Ensure q has batch dimension
         if q.ndim == 2:
             q = q.unsqueeze(1)  # [batch_size, 1, num_heads, head_dim]

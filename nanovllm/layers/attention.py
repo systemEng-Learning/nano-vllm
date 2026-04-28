@@ -78,6 +78,7 @@ class Attention(nn.Module):
                 max_seqlen_k=context.max_seqlen_k,
                 cu_seqlens_k=context.cu_seqlens_k,
                 block_table=context.block_tables,
+                *self.additional_cache_tensors,
             )
         else:  # decode
             # Pass all cache tensors to backend (quantized backends need scales, etc.)
