@@ -130,10 +130,9 @@ def store_kvcache_turboquant_kernel(
 
     key_cache_base = (slot * num_heads + head_idx) * key_packed_bytes
     key_pair = tl.arange(0, key_packed_bytes)
-    key_lo_offs = key_pair * 2
-    key_hi_offs = key_lo_offs + 1
-    key_lo = key_indices[key_lo_offs]
-    key_hi = tl.where(key_hi_offs < head_dim, key_indices[key_hi_offs], 0)
+    key_index_pairs = tl.reshape(key_indices, (key_packed_bytes, 2))
+    key_lo = key_index_pairs[:, 0]
+    key_hi = key_index_pairs[:, 1]
     key_packed = key_lo | (key_hi << 4)
     tl.store(k_cache_ptr + key_cache_base + key_pair, key_packed.to(tl.uint8))
 
@@ -149,10 +148,9 @@ def store_kvcache_turboquant_kernel(
 
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
     value_pair = tl.arange(0, value_packed_bytes)
-    value_lo_offs = value_pair * 2
-    value_hi_offs = value_lo_offs + 1
-    value_lo = value_indices[value_lo_offs]
-    value_hi = tl.where(value_hi_offs < head_dim, value_indices[value_hi_offs], 0)
+    value_index_pairs = tl.reshape(value_indices, (value_packed_bytes, 2))
+    value_lo = value_index_pairs[:, 0]
+    value_hi = value_index_pairs[:, 1]
     value_packed = value_lo | (value_hi << 4)
     tl.store(v_cache_ptr + value_cache_base + value_pair, value_packed.to(tl.uint8))
 
@@ -337,6 +335,10 @@ class TurboQuantKVCache(BaseKVCache):
         if head_dim < 1 or (head_dim & (head_dim - 1)) != 0:
             raise ValueError(
                 "TurboQuantKVCache requires a power-of-two head_dim for Hadamard rotation"
+            )
+        if head_dim % 2 != 0:
+            raise ValueError(
+                "TurboQuantKVCache requires an even head_dim for 4-bit pair packing"
             )
 
         self.key_bits = key_bits
