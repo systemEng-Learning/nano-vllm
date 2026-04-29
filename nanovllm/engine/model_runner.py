@@ -1,4 +1,5 @@
 import pickle
+import warnings
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -19,6 +20,36 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
+    @staticmethod
+    def _normalize_torch_dtype(raw_dtype) -> torch.dtype:
+        if isinstance(raw_dtype, torch.dtype):
+            return raw_dtype
+        if raw_dtype is None:
+            return torch.float16
+        if isinstance(raw_dtype, str):
+            key = raw_dtype.replace("torch.", "").lower()
+            mapping = {
+                "float16": torch.float16,
+                "half": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float32": torch.float32,
+                "float": torch.float32,
+            }
+            if key in mapping:
+                return mapping[key]
+        raise ValueError(f"Unsupported model dtype: {raw_dtype!r}")
+
+    def _resolve_model_dtype(self, raw_dtype) -> torch.dtype:
+        dtype = self._normalize_torch_dtype(raw_dtype)
+        major, minor = torch.cuda.get_device_capability(self.rank)
+        if dtype == torch.bfloat16 and major < 8:
+            warnings.warn(
+                "Model config requests bfloat16, but this GPU does not support native BF16 "
+                f"(compute capability {major}.{minor}). Falling back to float16."
+            )
+            return torch.float16
+        return dtype
+
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
@@ -30,8 +61,9 @@ class ModelRunner:
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        self.model_dtype = self._resolve_model_dtype(hf_config.torch_dtype)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(self.model_dtype)
         torch.set_default_device("cuda")
         
         # Create model from registry
@@ -132,7 +164,7 @@ class ModelRunner:
             block_size=self.block_size,
             num_heads=num_kv_heads,
             head_dim=head_dim,
-            dtype=hf_config.torch_dtype,
+            dtype=self.model_dtype,
         )
         block_bytes = temp_cache.get_cache_block_size_bytes()
         
@@ -157,7 +189,7 @@ class ModelRunner:
                     block_size=self.block_size,
                     num_heads=num_kv_heads,
                     head_dim=head_dim,
-                    dtype=hf_config.torch_dtype,
+                    dtype=self.model_dtype,
                 )
                 
                 # Let cache backend allocate its tensors
