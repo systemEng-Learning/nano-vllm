@@ -124,12 +124,12 @@ def store_kvcache_turboquant_kernel(
     rotated_key = tl.sum(rotation * key_unit[None, :], axis=1)
 
     key_indices = tl.zeros([head_dim], dtype=tl.int32)
-    for i in range(num_boundaries):
+    for i in tl.static_range(num_boundaries):
         boundary = tl.load(boundaries_ptr + i)
         key_indices += (rotated_key > boundary).to(tl.int32)
 
     key_cache_base = (slot * num_heads + head_idx) * key_packed_bytes
-    for i in range(key_packed_bytes):
+    for i in tl.static_range(key_packed_bytes):
         lo = key_indices[2 * i]
         hi = 0
         if 2 * i + 1 < head_dim:
@@ -148,7 +148,7 @@ def store_kvcache_turboquant_kernel(
     ).to(tl.int32)
 
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
-    for i in range(value_packed_bytes):
+    for i in tl.static_range(value_packed_bytes):
         lo = value_indices[2 * i]
         hi = 0
         if 2 * i + 1 < head_dim:
