@@ -23,7 +23,7 @@ from nanovllm.layers.attn_utils import normalize_decode_query
 from nanovllm.layers.flashinfer_flash_attn import FlashInferAttention
 
 
-_CONTINUATION_DECODE_THRESHOLD = 64
+_CONTINUATION_DECODE_THRESHOLD = 128
 
 
 @triton.jit
@@ -124,7 +124,6 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         v_scales: torch.Tensor,
         v_zeros: torch.Tensor,
         k_centroids: torch.Tensor,
-        rotation: torch.Tensor,
         out_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dense_k_rot, dense_v = dequantize_kvcache_turboquant(
@@ -138,45 +137,52 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             k_centroids,
             out_dtype,
         )
-        dense_k = torch.matmul(dense_k_rot.to(torch.float32), rotation.to(torch.float32)).to(
-            out_dtype
-        )
-        return dense_k, dense_v
+        return dense_k_rot, dense_v
+
+    def _rotate_query_for_turboquant(
+        self,
+        q: torch.Tensor,
+        rotation: torch.Tensor,
+    ) -> torch.Tensor:
+        # Keys in cache are stored in rotated space (k_rot = k @ R^T for row vectors).
+        # Instead of reconstructing unrotated keys (k = k_rot @ R), rotate the query once
+        # and compute attention in rotated space: q·k == (q @ R)·k_rot.
+        return torch.matmul(q, rotation.to(device=q.device, dtype=q.dtype))
 
     def _run_decode_attention(
         self,
-        q: torch.Tensor,
-        dense_k: torch.Tensor,
+        q_rot: torch.Tensor,
+        dense_k_rot: torch.Tensor,
         dense_v: torch.Tensor,
         scale: float,
     ) -> torch.Tensor:
-        q_t = q.unsqueeze(0).unsqueeze(2)
-        k_t = dense_k.transpose(0, 1).unsqueeze(0)
+        q_t = q_rot.unsqueeze(0).unsqueeze(2)
+        k_t = dense_k_rot.transpose(0, 1).unsqueeze(0)
         v_t = dense_v.transpose(0, 1).unsqueeze(0)
         out = F.scaled_dot_product_attention(
             q_t,
             k_t,
             v_t,
             scale=scale,
-            enable_gqa=(dense_k.shape[1] < q.shape[0]),
+            enable_gqa=(dense_k_rot.shape[1] < q_rot.shape[0]),
         )
         return out.squeeze(0).squeeze(1)
 
     def _run_prefill_attention(
         self,
-        q: torch.Tensor,
-        dense_k: torch.Tensor,
+        q_rot: torch.Tensor,
+        dense_k_rot: torch.Tensor,
         dense_v: torch.Tensor,
         cached_len: int,
         scale: float,
     ) -> torch.Tensor:
-        q_len = q.shape[0]
-        seq_len = dense_k.shape[0]
-        q_t = q.transpose(0, 1).unsqueeze(0)
-        k_t = dense_k.transpose(0, 1).unsqueeze(0)
+        q_len = q_rot.shape[0]
+        seq_len = dense_k_rot.shape[0]
+        q_t = q_rot.transpose(0, 1).unsqueeze(0)
+        k_t = dense_k_rot.transpose(0, 1).unsqueeze(0)
         v_t = dense_v.transpose(0, 1).unsqueeze(0)
-        q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + cached_len
-        k_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
+        q_pos = torch.arange(q_len, device=q_rot.device).unsqueeze(1) + cached_len
+        k_pos = torch.arange(seq_len, device=q_rot.device).unsqueeze(0)
         mask = k_pos <= q_pos
         out = F.scaled_dot_product_attention(
             q_t,
@@ -184,41 +190,41 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             v_t,
             attn_mask=mask,
             scale=scale,
-            enable_gqa=(dense_k.shape[1] < q.shape[1]),
+            enable_gqa=(dense_k_rot.shape[1] < q_rot.shape[1]),
         )
         return out.squeeze(0).transpose(0, 1)
 
     def _run_small_continuation_prefill(
         self,
-        q: torch.Tensor,
-        dense_k: torch.Tensor,
+        q_rot: torch.Tensor,
+        dense_k_rot: torch.Tensor,
         dense_v: torch.Tensor,
         cached_len: int,
         scale: float,
     ) -> torch.Tensor:
-        output = torch.empty_like(q)
-        block_d = triton.next_power_of_2(q.shape[-1])
+        output = torch.empty_like(q_rot)
+        block_d = triton.next_power_of_2(q_rot.shape[-1])
         block_k = 32
-        kv_group_size = q.shape[1] // dense_k.shape[1]
-        grid = (q.shape[0], q.shape[1])
+        kv_group_size = q_rot.shape[1] // dense_k_rot.shape[1]
+        grid = (q_rot.shape[0], q_rot.shape[1])
         _continuation_decode_attention_kernel[grid](
-            q,
-            dense_k,
+            q_rot,
+            dense_k_rot,
             dense_v,
             output,
-            q.stride(0),
-            q.stride(1),
-            dense_k.stride(0),
-            dense_k.stride(1),
+            q_rot.stride(0),
+            q_rot.stride(1),
+            dense_k_rot.stride(0),
+            dense_k_rot.stride(1),
             dense_v.stride(0),
             dense_v.stride(1),
             output.stride(0),
             output.stride(1),
             cached_len,
-            dense_k.shape[0],
+            dense_k_rot.shape[0],
             kv_group_size,
             scale,
-            head_dim=q.shape[-1],
+            head_dim=q_rot.shape[-1],
             block_d=block_d,
             block_k=block_k,
         )
@@ -250,7 +256,7 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             if q_len <= 0 or seq_len <= 0:
                 continue
             cached_len = seq_len - q_len
-            dense_k, dense_v = self._dequantize_sequence(
+            dense_k_rot, dense_v = self._dequantize_sequence(
                 k_cache,
                 v_cache,
                 seq_len,
@@ -259,22 +265,22 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
                 v_scales,
                 v_zeros,
                 k_centroids,
-                rotation,
                 q.dtype,
             )
             q_req = q[q_start:q_end]
+            q_req_rot = self._rotate_query_for_turboquant(q_req, rotation)
             if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                 output[q_start:q_end] = self._run_small_continuation_prefill(
-                    q_req,
-                    dense_k,
+                    q_req_rot,
+                    dense_k_rot,
                     dense_v,
                     cached_len,
                     scale,
                 )
             else:
                 output[q_start:q_end] = self._run_prefill_attention(
-                    q_req,
-                    dense_k,
+                    q_req_rot,
+                    dense_k_rot,
                     dense_v,
                     cached_len,
                     scale,
@@ -349,7 +355,7 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
 
         for req_idx in range(batch_size):
             seq_len = int(cache_seqlens[req_idx].item())
-            dense_k, dense_v = self._dequantize_sequence(
+            dense_k_rot, dense_v = self._dequantize_sequence(
                 k_cache,
                 v_cache,
                 seq_len,
@@ -358,12 +364,12 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
                 v_scales,
                 v_zeros,
                 k_centroids,
-                rotation,
                 q.dtype,
             )
+            q_rot = self._rotate_query_for_turboquant(q[req_idx], rotation)
             output[req_idx] = self._run_decode_attention(
-                q[req_idx],
-                dense_k,
+                q_rot,
+                dense_k_rot,
                 dense_v,
                 scale,
             )
