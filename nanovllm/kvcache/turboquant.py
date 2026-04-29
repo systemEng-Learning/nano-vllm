@@ -123,19 +123,19 @@ def store_kvcache_turboquant_kernel(
     rotation = tl.load(rotation_ptr + row_offsets * head_dim + col_offsets)
     rotated_key = tl.sum(rotation * key_unit[None, :], axis=1)
 
-    key_indices = tl.zeros([head_dim], dtype=tl.int32)
+    key_indices = tl.zeros((head_dim,), dtype=tl.int32)
     for i in tl.static_range(num_boundaries):
         boundary = tl.load(boundaries_ptr + i)
         key_indices += (rotated_key > boundary).to(tl.int32)
 
     key_cache_base = (slot * num_heads + head_idx) * key_packed_bytes
-    for i in tl.static_range(key_packed_bytes):
-        lo = key_indices[2 * i]
-        hi = 0
-        if 2 * i + 1 < head_dim:
-            hi = key_indices[2 * i + 1]
-        packed = lo | (hi << 4)
-        tl.store(k_cache_ptr + key_cache_base + i, packed.to(tl.uint8))
+    key_pair = tl.arange(0, key_packed_bytes)
+    key_lo_offs = key_pair * 2
+    key_hi_offs = key_lo_offs + 1
+    key_lo = key_indices[key_lo_offs]
+    key_hi = tl.where(key_hi_offs < head_dim, key_indices[key_hi_offs], 0)
+    key_packed = key_lo | (key_hi << 4)
+    tl.store(k_cache_ptr + key_cache_base + key_pair, key_packed.to(tl.uint8))
 
     value_min = tl.min(value, axis=0)
     value_max = tl.max(value, axis=0)
@@ -148,13 +148,13 @@ def store_kvcache_turboquant_kernel(
     ).to(tl.int32)
 
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
-    for i in tl.static_range(value_packed_bytes):
-        lo = value_indices[2 * i]
-        hi = 0
-        if 2 * i + 1 < head_dim:
-            hi = value_indices[2 * i + 1]
-        packed = lo | (hi << 4)
-        tl.store(v_cache_ptr + value_cache_base + i, packed.to(tl.uint8))
+    value_pair = tl.arange(0, value_packed_bytes)
+    value_lo_offs = value_pair * 2
+    value_hi_offs = value_lo_offs + 1
+    value_lo = value_indices[value_lo_offs]
+    value_hi = tl.where(value_hi_offs < head_dim, value_indices[value_hi_offs], 0)
+    value_packed = value_lo | (value_hi << 4)
+    tl.store(v_cache_ptr + value_cache_base + value_pair, value_packed.to(tl.uint8))
 
     meta_idx = slot * num_heads + head_idx
     tl.store(k_norms_ptr + meta_idx, safe_key_norm.to(tl.float16))
