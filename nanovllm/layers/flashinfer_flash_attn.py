@@ -187,25 +187,44 @@ class FlashInferAttention(BaseFlashAttentionBackend):
             _build_page_metadata(block_table, seq_lens, page_size)
         )
         wrapper = self._get_paged_prefill_wrapper(q.device, q.dtype)
-        wrapper.plan(
-            cu_seqlens_q.to(dtype=torch.int32).contiguous(),
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            q.shape[1],
-            k.shape[2],
-            q.shape[2],
-            page_size,
-            causal=True,
-            sm_scale=scale,
-            q_data_type=q.dtype,
-            kv_data_type=k.dtype,
-            seq_lens=seq_lens,
-            seq_lens_q=(cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32).contiguous(),
-            block_tables=block_table.to(torch.int32).contiguous(),
-            max_token_per_sequence=max_seqlen_q,
-            max_sequence_kv=max_seqlen_k,
-        )
+        cu_q = cu_seqlens_q.to(dtype=torch.int32).contiguous()
+        # FlashInfer API/behavior differs across versions. Some builds fail in the
+        # extended planner path for paged prefill; fall back to the minimal plan call.
+        try:
+            wrapper.plan(
+                cu_q,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                q.shape[1],
+                k.shape[2],
+                q.shape[2],
+                page_size,
+                causal=True,
+                sm_scale=scale,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+                seq_lens=seq_lens,
+                seq_lens_q=(cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32).contiguous(),
+                block_tables=block_table.to(torch.int32).contiguous(),
+                max_token_per_sequence=max_seqlen_q,
+                max_sequence_kv=max_seqlen_k,
+            )
+        except UnboundLocalError:
+            wrapper.plan(
+                cu_q,
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+                q.shape[1],
+                k.shape[2],
+                q.shape[2],
+                page_size,
+                causal=True,
+                sm_scale=scale,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+            )
         return wrapper.run(q, (k, v))
 
     def decode(
