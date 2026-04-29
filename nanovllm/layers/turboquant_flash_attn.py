@@ -26,7 +26,7 @@ from nanovllm.layers.attn_utils import normalize_decode_query
 from nanovllm.layers.flashinfer_flash_attn import FlashInferAttention
 
 
-_CONTINUATION_DECODE_THRESHOLD = 128
+_CONTINUATION_DECODE_THRESHOLD = 256
 
 
 @triton.jit
@@ -91,6 +91,123 @@ def _continuation_decode_attention_kernel(
     tl.store(out_ptr + out_base + d_offs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
 
 
+@triton.jit
+def _packed_continuation_decode_attention_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_norms_ptr,
+    v_scales_ptr,
+    v_zeros_ptr,
+    k_centroids_ptr,
+    block_table_ptr,
+    out_ptr,
+    q_stride_token,
+    q_stride_head,
+    k_cache_stride_block,
+    k_cache_stride_pos,
+    k_cache_stride_head,
+    v_cache_stride_block,
+    v_cache_stride_pos,
+    v_cache_stride_head,
+    meta_stride_block,
+    meta_stride_pos,
+    meta_stride_head,
+    block_table_stride,
+    out_stride_token,
+    out_stride_head,
+    cached_len,
+    seq_len,
+    kv_group_size,
+    softmax_scale,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    key_packed_bytes: tl.constexpr,
+    value_packed_bytes: tl.constexpr,
+    centroid_count: tl.constexpr,
+    block_d: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head = head_idx // kv_group_size
+    visible_len = cached_len + token_idx + 1
+
+    d_offs = tl.arange(0, block_d)
+    d_mask = d_offs < head_dim
+    q_base = token_idx * q_stride_token + head_idx * q_stride_head
+    q = tl.load(q_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+
+    byte_idx = d_offs // 2
+    bit_shift = (d_offs % 2) * 4
+
+    m_prev = -float("inf")
+    l_prev = 0.0
+    acc = tl.zeros([block_d], dtype=tl.float32)
+
+    for start_n in tl.range(0, seq_len, block_k):
+        kv_idx = start_n + tl.arange(0, block_k)
+        kv_mask = kv_idx < visible_len
+
+        page_idx = kv_idx // block_size
+        page_off = kv_idx % block_size
+        block_num = tl.load(block_table_ptr + page_idx * block_table_stride, mask=kv_mask, other=0).to(tl.int64)
+
+        k_base = (
+            block_num * k_cache_stride_block
+            + page_off.to(tl.int64) * k_cache_stride_pos
+            + tl.cast(kv_head, tl.int64) * k_cache_stride_head
+        )
+        meta_base = (
+            block_num * meta_stride_block
+            + page_off.to(tl.int64) * meta_stride_pos
+            + tl.cast(kv_head, tl.int64) * meta_stride_head
+        )
+
+        k_packed = tl.load(
+            k_cache_ptr + k_base[:, None] + byte_idx[None, :],
+            mask=kv_mask[:, None] & d_mask[None, :] & (byte_idx[None, :] < key_packed_bytes),
+            other=0,
+        ).to(tl.int32)
+        k_idx = ((k_packed >> bit_shift[None, :]) & 0xF).to(tl.int32)
+        k_idx = tl.where(d_mask[None, :], k_idx, 0)
+        centroid_mask = kv_mask[:, None] & d_mask[None, :] & (k_idx < centroid_count)
+        k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
+        k_norm = tl.load(k_norms_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
+        k = k_vals * k_norm[:, None]
+
+        scores = tl.sum(q[None, :] * k, axis=1) * softmax_scale
+        scores = tl.where(kv_mask, scores, -float("inf"))
+
+        m_curr = tl.max(scores, axis=0)
+        m_next = tl.maximum(m_prev, m_curr)
+        alpha = tl.exp(m_prev - m_next)
+        probs = tl.exp(scores - m_next)
+
+        v_base = (
+            block_num * v_cache_stride_block
+            + page_off.to(tl.int64) * v_cache_stride_pos
+            + tl.cast(kv_head, tl.int64) * v_cache_stride_head
+        )
+        v_packed = tl.load(
+            v_cache_ptr + v_base[:, None] + byte_idx[None, :],
+            mask=kv_mask[:, None] & d_mask[None, :] & (byte_idx[None, :] < value_packed_bytes),
+            other=0,
+        ).to(tl.int32)
+        v_idx = ((v_packed >> bit_shift[None, :]) & 0xF).to(tl.float32)
+        v_scale = tl.load(v_scales_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
+        v_zero = tl.load(v_zeros_ptr + meta_base, mask=kv_mask, other=0.0).to(tl.float32)
+        v = v_idx * v_scale[:, None] + v_zero[:, None]
+
+        acc = acc * alpha + tl.sum(probs[:, None] * v, axis=0)
+        l_prev = l_prev * alpha + tl.sum(probs, axis=0)
+        m_prev = m_next
+
+    out = acc / l_prev
+    out_base = token_idx * out_stride_token + head_idx * out_stride_head
+    tl.store(out_ptr + out_base + d_offs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
+
+
 @FlashAttentionRegistry.register("turboquant")
 class TurboQuantFlashAttention(BaseFlashAttentionBackend):
     """Attention backend for packed TurboQuant KV cache."""
@@ -98,6 +215,8 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
     def __init__(self):
         self._dense_prefill = FlashInferAttention()
         self._decode_workspace: dict[tuple[int, torch.dtype, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._prefill_arange_cache: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+        self._prefill_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
     @property
     def supports_quantized_cache_inputs(self) -> bool:
@@ -175,6 +294,32 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             self._decode_workspace[key] = (k_buf, v_buf)
         return self._decode_workspace[key]
 
+    def _get_arange_cache(
+        self,
+        size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (device.index or 0, dtype)
+        cached = self._prefill_arange_cache.get(key)
+        if cached is None or cached.shape[0] <= size:
+            cached = torch.arange(size + 1, device=device, dtype=dtype)
+            self._prefill_arange_cache[key] = cached
+        return cached
+
+    def _get_prefill_mask_buffer(
+        self,
+        q_len: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (device.index or 0, device)
+        cached = self._prefill_mask_cache.get(key)
+        if cached is None or cached.shape[0] < q_len or cached.shape[1] < seq_len:
+            cached = torch.empty((q_len, seq_len), dtype=torch.bool, device=device)
+            self._prefill_mask_cache[key] = cached
+        return cached[:q_len, :seq_len]
+
     def _run_decode_attention(
         self,
         q_rot: torch.Tensor,
@@ -201,15 +346,23 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         dense_v: torch.Tensor,
         cached_len: int,
         scale: float,
+        q_positions: Optional[torch.Tensor] = None,
+        k_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q_len = q_rot.shape[0]
         seq_len = dense_k_rot.shape[0]
         q_t = q_rot.transpose(0, 1).unsqueeze(0)
         k_t = dense_k_rot.transpose(0, 1).unsqueeze(0)
         v_t = dense_v.transpose(0, 1).unsqueeze(0)
-        q_pos = torch.arange(q_len, device=q_rot.device).unsqueeze(1) + cached_len
-        k_pos = torch.arange(seq_len, device=q_rot.device).unsqueeze(0)
-        mask = k_pos <= q_pos
+        if q_positions is None or k_positions is None:
+            q_pos = torch.arange(q_len, device=q_rot.device).unsqueeze(1) + cached_len
+            k_pos = torch.arange(seq_len, device=q_rot.device).unsqueeze(0)
+            mask = k_pos <= q_pos
+        else:
+            q_pos = q_positions[:q_len] + cached_len
+            k_pos = k_positions[:seq_len]
+            mask = self._get_prefill_mask_buffer(q_len, seq_len, q_rot.device)
+            torch.le(k_pos.unsqueeze(0), q_pos.unsqueeze(1), out=mask)
         out = F.scaled_dot_product_attention(
             q_t,
             k_t,
@@ -219,6 +372,62 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             enable_gqa=(dense_k_rot.shape[1] < q_rot.shape[1]),
         )
         return out.squeeze(0).transpose(0, 1)
+
+    def _run_small_continuation_prefill_packed(
+        self,
+        q_rot: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table_row: torch.Tensor,
+        k_norms: torch.Tensor,
+        v_scales: torch.Tensor,
+        v_zeros: torch.Tensor,
+        k_centroids: torch.Tensor,
+        cached_len: int,
+        seq_len: int,
+        scale: float,
+    ) -> torch.Tensor:
+        output = torch.empty_like(q_rot)
+        block_d = triton.next_power_of_2(q_rot.shape[-1])
+        block_k = 32
+        kv_group_size = q_rot.shape[1] // k_cache.shape[2]
+        _packed_continuation_decode_attention_kernel[(q_rot.shape[0], q_rot.shape[1])](
+            q_rot,
+            k_cache,
+            v_cache,
+            k_norms,
+            v_scales,
+            v_zeros,
+            k_centroids,
+            block_table_row,
+            output,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            k_norms.stride(0),
+            k_norms.stride(1),
+            k_norms.stride(2),
+            block_table_row.stride(0),
+            output.stride(0),
+            output.stride(1),
+            cached_len,
+            seq_len,
+            kv_group_size,
+            scale,
+            head_dim=q_rot.shape[-1],
+            block_size=k_cache.shape[1],
+            key_packed_bytes=k_cache.shape[-1],
+            value_packed_bytes=v_cache.shape[-1],
+            centroid_count=k_centroids.numel(),
+            block_d=block_d,
+            block_k=block_k,
+        )
+        return output
 
     def _run_small_continuation_prefill(
         self,
@@ -273,6 +482,17 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         output = torch.empty_like(q)
         q_starts = cu_seqlens_q.to(torch.int64).tolist()
         k_starts = cu_seqlens_k.to(torch.int64).tolist()
+        max_q_len = 0
+        max_seq_len = 0
+        for req_idx in range(block_table.shape[0]):
+            q_len = q_starts[req_idx + 1] - q_starts[req_idx]
+            seq_len = k_starts[req_idx + 1] - k_starts[req_idx]
+            if q_len > max_q_len:
+                max_q_len = q_len
+            if seq_len > max_seq_len:
+                max_seq_len = seq_len
+        q_positions = self._get_arange_cache(max_q_len, q.device, torch.int64)
+        k_positions = self._get_arange_cache(max_seq_len, q.device, torch.int64)
 
         for req_idx in range(block_table.shape[0]):
             q_start = q_starts[req_idx]
@@ -282,34 +502,51 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             if q_len <= 0 or seq_len <= 0:
                 continue
             cached_len = seq_len - q_len
-            dense_k_rot, dense_v = self._dequantize_sequence(
-                k_cache,
-                v_cache,
-                seq_len,
-                block_table[req_idx],
-                k_norms,
-                v_scales,
-                v_zeros,
-                k_centroids,
-                q.dtype,
-            )
             q_req = q[q_start:q_end]
             q_req_rot = self._rotate_query_for_turboquant(q_req, rotation)
-            if q_len <= _CONTINUATION_DECODE_THRESHOLD:
-                output[q_start:q_end] = self._run_small_continuation_prefill(
+            if 0 < cached_len and q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                output[q_start:q_end] = self._run_small_continuation_prefill_packed(
                     q_req_rot,
-                    dense_k_rot,
-                    dense_v,
+                    k_cache,
+                    v_cache,
+                    block_table[req_idx],
+                    k_norms,
+                    v_scales,
+                    v_zeros,
+                    k_centroids,
                     cached_len,
+                    seq_len,
                     scale,
                 )
             else:
+                dense_k_rot, dense_v = self._dequantize_sequence(
+                    k_cache,
+                    v_cache,
+                    seq_len,
+                    block_table[req_idx],
+                    k_norms,
+                    v_scales,
+                    v_zeros,
+                    k_centroids,
+                    q.dtype,
+                )
+                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                    output[q_start:q_end] = self._run_small_continuation_prefill(
+                        q_req_rot,
+                        dense_k_rot,
+                        dense_v,
+                        cached_len,
+                        scale,
+                    )
+                    continue
                 output[q_start:q_end] = self._run_prefill_attention(
                     q_req_rot,
                     dense_k_rot,
                     dense_v,
                     cached_len,
                     scale,
+                    q_positions=q_positions,
+                    k_positions=k_positions,
                 )
         return output
 
