@@ -8,7 +8,10 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import ModelRegistry
 from nanovllm.kvcache import KVCacheRegistry
-from nanovllm.layers.flash_attn_backend import FlashAttentionRegistry
+from nanovllm.layers.flash_attn_backend import (
+    FlashAttentionRegistry,
+    ensure_builtin_backends_registered,
+)
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -75,6 +78,7 @@ class ModelRunner:
                 break
 
     def create_attn_backend(self, backend_name: str):
+        ensure_builtin_backends_registered()
         try:
             return FlashAttentionRegistry.get(backend_name)()
         except KeyError:

@@ -1,7 +1,8 @@
 """Base flash attention backend interface for nano-vllm."""
 from abc import ABC, abstractmethod
+import importlib
 import torch
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class BaseFlashAttentionBackend(ABC):
@@ -91,6 +92,11 @@ class BaseFlashAttentionBackend(ABC):
         """Name of the backend implementation."""
         return self.__class__.__name__
 
+    @property
+    def supports_quantized_cache_inputs(self) -> bool:
+        """Whether the backend consumes packed KV cache tensors directly."""
+        return False
+
 
 class FlashAttentionRegistry:
     """
@@ -143,6 +149,7 @@ class FlashAttentionRegistry:
         Raises:
             KeyError: If backend is not registered
         """
+        ensure_builtin_backends_registered()
         if name not in cls._registry:
             available = ", ".join(cls._registry.keys())
             raise KeyError(
@@ -154,4 +161,15 @@ class FlashAttentionRegistry:
     @classmethod
     def list_backends(cls) -> list[str]:
         """List all registered backend names."""
+        ensure_builtin_backends_registered()
         return list(cls._registry.keys())
+
+
+def ensure_builtin_backends_registered() -> None:
+    """Import built-in backend modules so their registry decorators run."""
+    for module_name in (
+        "nanovllm.layers.default_flash_attn",
+        "nanovllm.layers.int8_flash_attn",
+        "nanovllm.layers.turboquant_flash_attn",
+    ):
+        importlib.import_module(module_name)

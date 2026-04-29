@@ -1,3 +1,0 @@
-[submodule "nanovllm/flash-attention-turing"]
-	path = nanovllm/flash-attention-turing
-	url = https://github.com/ssiu/flash-attention-turing.git

@@ -18,8 +18,10 @@ A lightweight vLLM implementation built from scratch.
 
 ## Installation
 
+For standard installs with FlashInfer:
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install "nano-vllm[flashinfer] @ git+https://github.com/GeeeekExplorer/nano-vllm.git"
 ```
 
 ## Model Download

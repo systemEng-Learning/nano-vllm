@@ -162,6 +162,146 @@ def store_kvcache_turboquant_kernel(
     tl.store(v_zeros_ptr + meta_idx, value_min.to(tl.float16))
 
 
+@triton.jit
+def dequantize_kvcache_turboquant_kernel(
+    k_cache_ptr,
+    v_cache_ptr,
+    block_table_ptr,
+    k_norms_ptr,
+    v_scales_ptr,
+    v_zeros_ptr,
+    k_centroids_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    k_cache_stride_block,
+    k_cache_stride_pos,
+    k_cache_stride_head,
+    v_cache_stride_block,
+    v_cache_stride_pos,
+    v_cache_stride_head,
+    block_table_stride,
+    meta_stride_block,
+    meta_stride_pos,
+    meta_stride_head,
+    out_stride_token,
+    out_stride_head,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    num_heads: tl.constexpr,
+    key_packed_bytes: tl.constexpr,
+    value_packed_bytes: tl.constexpr,
+    centroid_count: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    page_idx = token_idx // block_size
+    page_off = token_idx % block_size
+    block_num = tl.load(block_table_ptr + page_idx * block_table_stride).to(tl.int64)
+
+    k_base = (
+        block_num * k_cache_stride_block
+        + page_off.to(tl.int64) * k_cache_stride_pos
+        + tl.cast(head_idx, tl.int64) * k_cache_stride_head
+    )
+    v_base = (
+        block_num * v_cache_stride_block
+        + page_off.to(tl.int64) * v_cache_stride_pos
+        + tl.cast(head_idx, tl.int64) * v_cache_stride_head
+    )
+    meta_base = (
+        block_num * meta_stride_block
+        + page_off.to(tl.int64) * meta_stride_pos
+        + tl.cast(head_idx, tl.int64) * meta_stride_head
+    )
+    out_base = token_idx * out_stride_token + head_idx * out_stride_head
+
+    d_offs = tl.arange(0, block_d)
+    d_mask = d_offs < head_dim
+    byte_idx = d_offs // 2
+    bit_shift = (d_offs % 2) * 4
+
+    k_packed = tl.load(
+        k_cache_ptr + k_base + byte_idx,
+        mask=d_mask & (byte_idx < key_packed_bytes),
+        other=0,
+    ).to(tl.int32)
+    k_idx = ((k_packed >> bit_shift) & 0xF).to(tl.int32)
+    k_idx = tl.where(d_mask, k_idx, 0)
+    centroid_mask = d_mask & (k_idx < centroid_count)
+    k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
+    k_norm = tl.load(k_norms_ptr + meta_base).to(tl.float32)
+    tl.store(k_out_ptr + out_base + d_offs, (k_vals * k_norm).to(k_out_ptr.dtype.element_ty), mask=d_mask)
+
+    v_packed = tl.load(
+        v_cache_ptr + v_base + byte_idx,
+        mask=d_mask & (byte_idx < value_packed_bytes),
+        other=0,
+    ).to(tl.int32)
+    v_idx = ((v_packed >> bit_shift) & 0xF).to(tl.float32)
+    v_scale = tl.load(v_scales_ptr + meta_base).to(tl.float32)
+    v_zero = tl.load(v_zeros_ptr + meta_base).to(tl.float32)
+    v_vals = v_idx * v_scale + v_zero
+    tl.store(v_out_ptr + out_base + d_offs, v_vals.to(v_out_ptr.dtype.element_ty), mask=d_mask)
+
+
+def dequantize_kvcache_turboquant(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_len: int,
+    block_table_row: torch.Tensor,
+    k_norms: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zeros: torch.Tensor,
+    k_centroids: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if seq_len <= 0:
+        raise ValueError("TurboQuant dequantization expects a positive sequence length.")
+
+    head_dim = k_norms.shape[-1] if k_norms.ndim > 3 else k_cache.shape[-1] * 2
+    num_heads = k_cache.shape[2]
+    block_size = k_cache.shape[1]
+    block_d = triton.next_power_of_2(head_dim)
+    block_table_row = block_table_row.to(device=k_cache.device, dtype=torch.int32).contiguous()
+    dense_k = torch.empty((seq_len, num_heads, head_dim), dtype=out_dtype, device=k_cache.device)
+    dense_v = torch.empty_like(dense_k)
+
+    grid = (seq_len, num_heads)
+    dequantize_kvcache_turboquant_kernel[grid](
+        k_cache,
+        v_cache,
+        block_table_row,
+        k_norms,
+        v_scales,
+        v_zeros,
+        k_centroids,
+        dense_k,
+        dense_v,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        block_table_row.stride(0),
+        k_norms.stride(0),
+        k_norms.stride(1),
+        k_norms.stride(2),
+        dense_k.stride(0),
+        dense_k.stride(1),
+        head_dim=head_dim,
+        block_size=block_size,
+        num_heads=num_heads,
+        key_packed_bytes=k_cache.shape[-1],
+        value_packed_bytes=v_cache.shape[-1],
+        centroid_count=k_centroids.numel(),
+        block_d=block_d,
+    )
+    return dense_k, dense_v
+
+
 @KVCacheRegistry.register("turboquant")
 class TurboQuantKVCache(BaseKVCache):
     """
@@ -284,8 +424,8 @@ class TurboQuantKVCache(BaseKVCache):
         *additional_tensors,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
-            "TurboQuantKVCache only implements packed quantized storage. "
-            "Dequantization should happen inside the future fused FlashAttention kernel."
+            "TurboQuantKVCache stores packed tensors only. "
+            "Use the TurboQuant attention backend to consume the cache directly."
         )
 
     def needs_dequantization(self) -> bool:
