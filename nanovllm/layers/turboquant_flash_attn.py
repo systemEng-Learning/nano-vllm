@@ -160,7 +160,7 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             scale=scale,
             enable_gqa=(dense_k.shape[1] < q.shape[0]),
         )
-        return out.squeeze(0).squeeze(1).transpose(0, 1)
+        return out.squeeze(0).squeeze(1)
 
     def _run_prefill_attention(
         self,
