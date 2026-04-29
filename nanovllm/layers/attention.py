@@ -94,13 +94,15 @@ class Attention(nn.Module):
                 attention_cache_tensors = self.additional_cache_tensors
             
             o = self.attn_backend.prefill(
-                q, k, v,
-                scale=self.scale,
-                max_seqlen_q=context.max_seqlen_q,
-                cu_seqlens_q=context.cu_seqlens_q,
-                max_seqlen_k=context.max_seqlen_k,
-                cu_seqlens_k=context.cu_seqlens_k,
-                block_table=context.block_tables,
+                q,
+                k,
+                v,
+                self.scale,
+                context.max_seqlen_q,
+                context.cu_seqlens_q,
+                context.max_seqlen_k,
+                context.cu_seqlens_k,
+                context.block_tables,
                 *attention_cache_tensors,
             )
         else:  # decode
@@ -110,9 +112,9 @@ class Attention(nn.Module):
                 q,
                 attn_k_cache,
                 attn_v_cache,
-                scale=self.scale,
-                cache_seqlens=context.context_lens,
-                block_table=context.block_tables,
+                self.scale,
+                context.context_lens,
+                context.block_tables,
                 *attention_cache_tensors,
             )
         
