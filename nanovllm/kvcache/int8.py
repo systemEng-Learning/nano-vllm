@@ -28,8 +28,21 @@ def store_kvcache_int8_kernel(
     k_scale = tl.where(k_scale == 0.0, 1.0, k_scale)
     v_scale = tl.where(v_scale == 0.0, 1.0, v_scale)
 
-    k_quant = tl.clamp(tl.math.llrint(key / k_scale), -128, 127).to(tl.int8)
-    v_quant = tl.clamp(tl.math.llrint(value / v_scale), -128, 127).to(tl.int8)
+    k_scaled = key / k_scale
+    v_scaled = value / v_scale
+    # Triton compatibility: avoid tl.math.llrint (missing on some builds).
+    k_rounded = tl.where(
+        k_scaled >= 0.0,
+        tl.floor(k_scaled + 0.5),
+        -tl.floor(-k_scaled + 0.5),
+    )
+    v_rounded = tl.where(
+        v_scaled >= 0.0,
+        tl.floor(v_scaled + 0.5),
+        -tl.floor(-v_scaled + 0.5),
+    )
+    k_quant = tl.clamp(k_rounded, -128, 127).to(tl.int8)
+    v_quant = tl.clamp(v_rounded, -128, 127).to(tl.int8)
 
     cache_offsets = slot * D + offsets
     tl.store(k_cache_ptr + cache_offsets, k_quant)

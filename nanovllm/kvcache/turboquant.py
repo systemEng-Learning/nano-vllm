@@ -139,11 +139,14 @@ def store_kvcache_turboquant_kernel(
     value_max = tl.max(value, axis=0)
     value_scale = (value_max - value_min) / 15.0
     value_scale = tl.where(value_scale > 0.0, value_scale, 1.0)
-    value_indices = tl.clamp(
-        tl.math.llrint((value - value_min) / value_scale),
-        0,
-        15,
-    ).to(tl.int32)
+    value_scaled = (value - value_min) / value_scale
+    # Triton compatibility: avoid tl.math.llrint (missing on some builds).
+    value_rounded = tl.where(
+        value_scaled >= 0.0,
+        tl.floor(value_scaled + 0.5),
+        -tl.floor(-value_scaled + 0.5),
+    )
+    value_indices = tl.clamp(value_rounded, 0, 15).to(tl.int32)
 
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
     value_pairs = tl.reshape(value_indices, (value_packed_bytes, 2))
