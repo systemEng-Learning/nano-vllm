@@ -79,9 +79,12 @@ def _hadamard_matrix(head_dim: int) -> torch.Tensor:
 
 @triton.jit
 def store_kvcache_turboquant_kernel(
-    key_ptr,
-    key_token_stride,
-    key_head_stride,
+    rotated_key_ptr,
+    rotated_key_token_stride,
+    rotated_key_head_stride,
+    key_norm_ptr,
+    key_norm_token_stride,
+    key_norm_head_stride,
     value_ptr,
     value_token_stride,
     value_head_stride,
@@ -91,7 +94,6 @@ def store_kvcache_turboquant_kernel(
     v_scales_ptr,
     v_zeros_ptr,
     slot_mapping_ptr,
-    rotation_ptr,
     boundaries_ptr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -107,21 +109,21 @@ def store_kvcache_turboquant_kernel(
         return
 
     offsets = tl.arange(0, head_dim)
-    key = tl.load(
-        key_ptr + token_idx * key_token_stride + head_idx * key_head_stride + offsets
+    rotated_key = tl.load(
+        rotated_key_ptr
+        + token_idx * rotated_key_token_stride
+        + head_idx * rotated_key_head_stride
+        + offsets
     ).to(tl.float32)
     value = tl.load(
         value_ptr + token_idx * value_token_stride + head_idx * value_head_stride + offsets
     ).to(tl.float32)
-
-    key_norm = tl.sqrt(tl.sum(key * key, axis=0))
+    key_norm = tl.load(
+        key_norm_ptr
+        + token_idx * key_norm_token_stride
+        + head_idx * key_norm_head_stride
+    ).to(tl.float32)
     safe_key_norm = tl.where(key_norm > 0.0, key_norm, 1.0)
-    key_unit = key / safe_key_norm
-
-    row_offsets = tl.arange(0, head_dim)[:, None]
-    col_offsets = tl.arange(0, head_dim)[None, :]
-    rotation = tl.load(rotation_ptr + row_offsets * head_dim + col_offsets)
-    rotated_key = tl.sum(rotation * key_unit[None, :], axis=1)
 
     key_indices = tl.zeros((head_dim,), dtype=tl.int32)
     for i in tl.static_range(num_boundaries):
@@ -301,6 +303,216 @@ def dequantize_kvcache_turboquant(
     return dense_k, dense_v
 
 
+@triton.jit
+def dequantize_kvcache_turboquant_batched_kernel(
+    k_cache_ptr,
+    v_cache_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    k_norms_ptr,
+    v_scales_ptr,
+    v_zeros_ptr,
+    k_centroids_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    k_cache_stride_block,
+    k_cache_stride_pos,
+    k_cache_stride_head,
+    v_cache_stride_block,
+    v_cache_stride_pos,
+    v_cache_stride_head,
+    block_table_stride_batch,
+    block_table_stride_block,
+    meta_stride_block,
+    meta_stride_pos,
+    meta_stride_head,
+    out_stride_batch,
+    out_stride_token,
+    out_stride_head,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    num_heads: tl.constexpr,
+    key_packed_bytes: tl.constexpr,
+    value_packed_bytes: tl.constexpr,
+    centroid_count: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    batch_idx = tl.program_id(2)
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx).to(tl.int32)
+    if token_idx >= seq_len:
+        return
+
+    page_idx = token_idx // block_size
+    page_off = token_idx % block_size
+    block_num = tl.load(
+        block_table_ptr
+        + batch_idx * block_table_stride_batch
+        + page_idx * block_table_stride_block
+    ).to(tl.int64)
+
+    k_base = (
+        block_num * k_cache_stride_block
+        + page_off.to(tl.int64) * k_cache_stride_pos
+        + tl.cast(head_idx, tl.int64) * k_cache_stride_head
+    )
+    v_base = (
+        block_num * v_cache_stride_block
+        + page_off.to(tl.int64) * v_cache_stride_pos
+        + tl.cast(head_idx, tl.int64) * v_cache_stride_head
+    )
+    meta_base = (
+        block_num * meta_stride_block
+        + page_off.to(tl.int64) * meta_stride_pos
+        + tl.cast(head_idx, tl.int64) * meta_stride_head
+    )
+    out_base = (
+        batch_idx * out_stride_batch
+        + token_idx * out_stride_token
+        + head_idx * out_stride_head
+    )
+
+    d_offs = tl.arange(0, block_d)
+    d_mask = d_offs < head_dim
+    byte_idx = d_offs // 2
+    bit_shift = (d_offs % 2) * 4
+
+    k_packed = tl.load(
+        k_cache_ptr + k_base + byte_idx,
+        mask=d_mask & (byte_idx < key_packed_bytes),
+        other=0,
+    ).to(tl.int32)
+    k_idx = ((k_packed >> bit_shift) & 0xF).to(tl.int32)
+    k_idx = tl.where(d_mask, k_idx, 0)
+    centroid_mask = d_mask & (k_idx < centroid_count)
+    k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
+    k_norm = tl.load(k_norms_ptr + meta_base).to(tl.float32)
+    tl.store(
+        k_out_ptr + out_base + d_offs,
+        (k_vals * k_norm).to(k_out_ptr.dtype.element_ty),
+        mask=d_mask,
+    )
+
+    v_packed = tl.load(
+        v_cache_ptr + v_base + byte_idx,
+        mask=d_mask & (byte_idx < value_packed_bytes),
+        other=0,
+    ).to(tl.int32)
+    v_idx = ((v_packed >> bit_shift) & 0xF).to(tl.float32)
+    v_scale = tl.load(v_scales_ptr + meta_base).to(tl.float32)
+    v_zero = tl.load(v_zeros_ptr + meta_base).to(tl.float32)
+    v_vals = v_idx * v_scale + v_zero
+    tl.store(v_out_ptr + out_base + d_offs, v_vals.to(v_out_ptr.dtype.element_ty), mask=d_mask)
+
+
+def dequantize_kvcache_turboquant_batched(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k_norms: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zeros: torch.Tensor,
+    k_centroids: torch.Tensor,
+    out_dtype: torch.dtype,
+    max_seq_len: int | None = None,
+    out_k: torch.Tensor | None = None,
+    out_v: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if block_table.ndim != 2:
+        raise ValueError("block_table must have shape [batch_size, max_num_blocks].")
+    if seq_lens.ndim != 1:
+        raise ValueError("seq_lens must have shape [batch_size].")
+    if block_table.shape[0] != seq_lens.shape[0]:
+        raise ValueError("block_table and seq_lens batch size mismatch.")
+
+    batch_size = block_table.shape[0]
+    if batch_size == 0:
+        num_heads = k_cache.shape[2]
+        head_dim = k_cache.shape[-1] * 2
+        empty = torch.empty((0, 0, num_heads, head_dim), dtype=out_dtype, device=k_cache.device)
+        return empty, empty
+
+    seq_lens = seq_lens.to(device=k_cache.device, dtype=torch.int32).contiguous()
+    if max_seq_len is None:
+        max_seq_len = int(seq_lens.max().item())
+    if max_seq_len <= 0:
+        num_heads = k_cache.shape[2]
+        head_dim = k_cache.shape[-1] * 2
+        empty = torch.empty((batch_size, 0, num_heads, head_dim), dtype=out_dtype, device=k_cache.device)
+        return empty, empty
+
+    head_dim = k_norms.shape[-1] if k_norms.ndim > 3 else k_cache.shape[-1] * 2
+    num_heads = k_cache.shape[2]
+    block_size = k_cache.shape[1]
+    block_d = triton.next_power_of_2(head_dim)
+    block_table = block_table.to(device=k_cache.device, dtype=torch.int32).contiguous()
+
+    if out_k is None or out_v is None:
+        dense_k = torch.empty(
+            (batch_size, max_seq_len, num_heads, head_dim),
+            dtype=out_dtype,
+            device=k_cache.device,
+        )
+        dense_v = torch.empty_like(dense_k)
+    else:
+        if (
+            out_k.device != k_cache.device
+            or out_v.device != k_cache.device
+            or out_k.dtype != out_dtype
+            or out_v.dtype != out_dtype
+            or out_k.shape[0] < batch_size
+            or out_v.shape[0] < batch_size
+            or out_k.shape[1] < max_seq_len
+            or out_v.shape[1] < max_seq_len
+            or out_k.shape[2] != num_heads
+            or out_v.shape[2] != num_heads
+            or out_k.shape[3] != head_dim
+            or out_v.shape[3] != head_dim
+        ):
+            raise ValueError("Provided output buffers are incompatible with requested dequant shape.")
+        dense_k = out_k[:batch_size, :max_seq_len]
+        dense_v = out_v[:batch_size, :max_seq_len]
+
+    grid = (max_seq_len, num_heads, batch_size)
+    dequantize_kvcache_turboquant_batched_kernel[grid](
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        k_norms,
+        v_scales,
+        v_zeros,
+        k_centroids,
+        dense_k,
+        dense_v,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        block_table.stride(0),
+        block_table.stride(1),
+        k_norms.stride(0),
+        k_norms.stride(1),
+        k_norms.stride(2),
+        dense_k.stride(0),
+        dense_k.stride(1),
+        dense_k.stride(2),
+        head_dim=head_dim,
+        block_size=block_size,
+        num_heads=num_heads,
+        key_packed_bytes=k_cache.shape[-1],
+        value_packed_bytes=v_cache.shape[-1],
+        centroid_count=k_centroids.numel(),
+        block_d=block_d,
+    )
+    return dense_k, dense_v
+
+
 @KVCacheRegistry.register("turboquant")
 class TurboQuantKVCache(BaseKVCache):
     """
@@ -398,10 +610,23 @@ class TurboQuantKVCache(BaseKVCache):
         assert k_cache.shape[-1] == self.key_packed_bytes
         assert v_cache.shape[-1] == self.value_packed_bytes
 
+        # Use batched GEMM for Hadamard rotation instead of loading a D x D
+        # matrix per token/head inside the Triton store kernel.
+        key_fp32 = key.to(torch.float32)
+        key_norm_input = torch.linalg.norm(key_fp32, dim=-1)
+        safe_norm = torch.clamp_min(key_norm_input, 1e-12).unsqueeze(-1)
+        key_unit = key_fp32 / safe_norm
+        rotation_fp32 = rotation.to(device=key.device, dtype=torch.float32)
+        rotated_key = torch.matmul(key_unit, rotation_fp32.t()).contiguous()
+        key_norm_input = key_norm_input.contiguous()
+
         store_kvcache_turboquant_kernel[(num_tokens * num_heads,)](
-            key,
-            key.stride(0),
-            key.stride(1),
+            rotated_key,
+            rotated_key.stride(0),
+            rotated_key.stride(1),
+            key_norm_input,
+            key_norm_input.stride(0),
+            key_norm_input.stride(1),
             value,
             value.stride(0),
             value.stride(1),
@@ -411,7 +636,6 @@ class TurboQuantKVCache(BaseKVCache):
             v_scales.view(-1),
             v_zeros.view(-1),
             slot_mapping,
-            rotation.view(-1),
             self._k_boundaries,
             self.num_heads,
             self.head_dim,

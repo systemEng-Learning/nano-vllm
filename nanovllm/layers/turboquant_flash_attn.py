@@ -14,7 +14,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from nanovllm.kvcache.turboquant import dequantize_kvcache_turboquant
+from nanovllm.kvcache.turboquant import (
+    dequantize_kvcache_turboquant,
+    dequantize_kvcache_turboquant_batched,
+)
 from nanovllm.layers.flash_attn_backend import (
     BaseFlashAttentionBackend,
     FlashAttentionRegistry,
@@ -94,6 +97,7 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
 
     def __init__(self):
         self._dense_prefill = FlashInferAttention()
+        self._decode_workspace: dict[tuple[int, torch.dtype, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def supports_quantized_cache_inputs(self) -> bool:
@@ -148,6 +152,28 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         # Instead of reconstructing unrotated keys (k = k_rot @ R), rotate the query once
         # and compute attention in rotated space: q·k == (q @ R)·k_rot.
         return torch.matmul(q, rotation.to(device=q.device, dtype=q.dtype))
+
+    def _get_decode_workspace(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (device.index or 0, dtype, num_kv_heads, head_dim)
+        cached = self._decode_workspace.get(key)
+        if (
+            cached is None
+            or cached[0].shape[0] < batch_size
+            or cached[0].shape[1] < max_seq_len
+        ):
+            shape = (batch_size, max_seq_len, num_kv_heads, head_dim)
+            k_buf = torch.empty(shape, dtype=dtype, device=device)
+            v_buf = torch.empty_like(k_buf)
+            self._decode_workspace[key] = (k_buf, v_buf)
+        return self._decode_workspace[key]
 
     def _run_decode_attention(
         self,
@@ -351,26 +377,54 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         )
         q = normalize_decode_query(q)
         batch_size = q.shape[0]
-        output = torch.empty_like(q)
+        if batch_size == 0:
+            return q.unsqueeze(1)
 
-        for req_idx in range(batch_size):
-            seq_len = int(cache_seqlens[req_idx].item())
-            dense_k_rot, dense_v = self._dequantize_sequence(
-                k_cache,
-                v_cache,
-                seq_len,
-                block_table[req_idx],
-                k_norms,
-                v_scales,
-                v_zeros,
-                k_centroids,
-                q.dtype,
-            )
-            q_rot = self._rotate_query_for_turboquant(q[req_idx], rotation)
-            output[req_idx] = self._run_decode_attention(
-                q_rot,
-                dense_k_rot,
-                dense_v,
-                scale,
-            )
-        return output.unsqueeze(1)
+        seq_lens = cache_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+        max_seq_len = int(seq_lens.max().item())
+        if max_seq_len <= 0:
+            return torch.zeros_like(q).unsqueeze(1)
+
+        num_kv_heads = k_cache.shape[2]
+        head_dim = q.shape[-1]
+        k_buf, v_buf = self._get_decode_workspace(
+            batch_size,
+            max_seq_len,
+            num_kv_heads,
+            head_dim,
+            q.dtype,
+            q.device,
+        )
+        dense_k_rot, dense_v = dequantize_kvcache_turboquant_batched(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            k_norms,
+            v_scales,
+            v_zeros,
+            k_centroids,
+            q.dtype,
+            max_seq_len=max_seq_len,
+            out_k=k_buf,
+            out_v=v_buf,
+        )
+        q_rot = self._rotate_query_for_turboquant(q, rotation)
+
+        # Decode query length is always 1. We mask KV positions > seq_len for each request.
+        q_t = q_rot.unsqueeze(2)
+        k_t = dense_k_rot.transpose(1, 2)
+        v_t = dense_v.transpose(1, 2)
+        kv_pos = torch.arange(max_seq_len, device=q.device, dtype=seq_lens.dtype).unsqueeze(0)
+        attn_mask = kv_pos < seq_lens.unsqueeze(1)
+        attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)
+
+        out = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=attn_mask,
+            scale=scale,
+            enable_gqa=(num_kv_heads < q.shape[1]),
+        )
+        return out.squeeze(2).unsqueeze(1)
