@@ -129,12 +129,11 @@ def store_kvcache_turboquant_kernel(
         key_indices += (rotated_key > boundary).to(tl.int32)
 
     key_cache_base = (slot * num_heads + head_idx) * key_packed_bytes
-    key_pair = tl.arange(0, key_packed_bytes)
-    key_index_pairs = tl.reshape(key_indices, (key_packed_bytes, 2))
-    key_lo = key_index_pairs[:, 0]
-    key_hi = key_index_pairs[:, 1]
+    key_pairs = tl.reshape(key_indices, (key_packed_bytes, 2))
+    key_lo, key_hi = tl.split(key_pairs)
     key_packed = key_lo | (key_hi << 4)
-    tl.store(k_cache_ptr + key_cache_base + key_pair, key_packed.to(tl.uint8))
+    key_pair_offs = tl.arange(0, key_packed_bytes)
+    tl.store(k_cache_ptr + key_cache_base + key_pair_offs, key_packed.to(tl.uint8))
 
     value_min = tl.min(value, axis=0)
     value_max = tl.max(value, axis=0)
@@ -147,12 +146,11 @@ def store_kvcache_turboquant_kernel(
     ).to(tl.int32)
 
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
-    value_pair = tl.arange(0, value_packed_bytes)
-    value_index_pairs = tl.reshape(value_indices, (value_packed_bytes, 2))
-    value_lo = value_index_pairs[:, 0]
-    value_hi = value_index_pairs[:, 1]
+    value_pairs = tl.reshape(value_indices, (value_packed_bytes, 2))
+    value_lo, value_hi = tl.split(value_pairs)
     value_packed = value_lo | (value_hi << 4)
-    tl.store(v_cache_ptr + value_cache_base + value_pair, value_packed.to(tl.uint8))
+    value_pair_offs = tl.arange(0, value_packed_bytes)
+    tl.store(v_cache_ptr + value_cache_base + value_pair_offs, value_packed.to(tl.uint8))
 
     meta_idx = slot * num_heads + head_idx
     tl.store(k_norms_ptr + meta_idx, safe_key_norm.to(tl.float16))
