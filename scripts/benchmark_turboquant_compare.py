@@ -19,11 +19,13 @@ import subprocess
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 RESULT_PREFIX = "RESULT_JSON:"
-DEFAULT_MODEL = "~/huggingface/Qwen3-0.6B/"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL = "models/Qwen3-0.6B/"
 DEFAULT_NANO_BACKENDS = "turboquant"
 DEFAULT_VLLM_KV_CACHE_DTYPES = "turboquant_4bit_nc"
 
@@ -162,6 +164,51 @@ def parse_args() -> argparse.Namespace:
 
 def csv_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def model_arg_looks_like_path(model: str) -> bool:
+    expanded = os.path.expanduser(model)
+    return (
+        os.path.isabs(expanded)
+        or model.startswith("~/")
+        or model.startswith("./")
+        or model.startswith("../")
+    )
+
+
+def normalize_model_arg(model: str) -> str:
+    expanded = os.path.expanduser(model)
+    path = Path(expanded)
+    if path.exists():
+        return str(path.resolve())
+    if not path.is_absolute():
+        repo_path = REPO_ROOT / path
+        if repo_path.exists():
+            return str(repo_path.resolve())
+    return expanded
+
+
+def validate_model_arg(model: str, candidates: list[tuple[str, str]]) -> None:
+    path = Path(os.path.expanduser(model))
+    uses_nanovllm = any(engine == "nanovllm" for engine, _ in candidates)
+
+    if uses_nanovllm and not path.is_dir():
+        raise SystemExit(
+            "Model directory not found for nano-vLLM benchmark:\n"
+            f"  {path}\n"
+            "nano-vLLM currently requires --model to point to a local "
+            "Hugging Face model directory. In Colab, pass the repo-relative "
+            "path, for example --model models/Qwen3-0.6B/, "
+            "or run only upstream vLLM with --engines vllm and a valid model id/path."
+        )
+
+    if not uses_nanovllm and model_arg_looks_like_path(model) and not path.is_dir():
+        raise SystemExit(
+            "Model path not found:\n"
+            f"  {path}\n"
+            "For upstream vLLM, pass either an existing local directory or a "
+            "Hugging Face model id such as Qwen/Qwen3-0.6B."
+        )
 
 
 def get_vocab_size(model: str) -> int:
@@ -601,6 +648,7 @@ def print_summary(results: list[CandidateResult]) -> None:
 
 def main() -> None:
     args = parse_args()
+    args.model = normalize_model_arg(args.model)
     if args.worker:
         print_worker_result(run_worker(args))
         return
@@ -619,6 +667,7 @@ def main() -> None:
         raise ValueError(f"Unknown engines: {unknown}")
     if not candidates:
         raise ValueError("No benchmark candidates selected.")
+    validate_model_arg(args.model, candidates)
 
     print("Benchmark workload:")
     print(
