@@ -25,7 +25,9 @@ from typing import Any
 
 RESULT_PREFIX = "RESULT_JSON:"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = "models/Qwen3-0.6B/"
+DEFAULT_MODEL_BASENAME = "Qwen3-0.6B"
+DEFAULT_NANO_MODEL = f"/models/{DEFAULT_MODEL_BASENAME}/"
+DEFAULT_VLLM_MODEL = f"Qwen/{DEFAULT_MODEL_BASENAME}"
 DEFAULT_NANO_BACKENDS = "turboquant"
 DEFAULT_VLLM_KV_CACHE_DTYPES = "turboquant_4bit_nc"
 
@@ -107,10 +109,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default=os.path.expanduser(DEFAULT_MODEL),
+        default=None,
         help=(
-            "Local HF model path or model id. nano-vLLM requires a local "
-            f"directory. Default: {DEFAULT_MODEL}"
+            "Compatibility override: use the same model path/id for both "
+            "nano-vLLM and vLLM. Prefer --nano-model and --vllm-model when "
+            "you want separate defaults."
+        ),
+    )
+    parser.add_argument(
+        "--nano-model",
+        type=str,
+        default=DEFAULT_NANO_MODEL,
+        help=(
+            "Local HF model directory for nano-vLLM. "
+            f"Default: {DEFAULT_NANO_MODEL}"
+        ),
+    )
+    parser.add_argument(
+        "--vllm-model",
+        type=str,
+        default=DEFAULT_VLLM_MODEL,
+        help=(
+            "Model path or Hugging Face id for upstream vLLM. "
+            f"Default: {DEFAULT_VLLM_MODEL}"
         ),
     )
     parser.add_argument(
@@ -166,49 +187,128 @@ def csv_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def model_arg_looks_like_path(model: str) -> bool:
+def model_arg_looks_like_local_path(model: str) -> bool:
     expanded = os.path.expanduser(model)
     return (
         os.path.isabs(expanded)
+        or model.startswith("models/")
         or model.startswith("~/")
         or model.startswith("./")
         or model.startswith("../")
     )
 
 
-def normalize_model_arg(model: str) -> str:
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def model_path_candidates(model: str) -> list[Path]:
     expanded = os.path.expanduser(model)
     path = Path(expanded)
-    if path.exists():
-        return str(path.resolve())
+    candidates = [path]
+
     if not path.is_absolute():
-        repo_path = REPO_ROOT / path
-        if repo_path.exists():
-            return str(repo_path.resolve())
-    return expanded
-
-
-def validate_model_arg(model: str, candidates: list[tuple[str, str]]) -> None:
-    path = Path(os.path.expanduser(model))
-    uses_nanovllm = any(engine == "nanovllm" for engine, _ in candidates)
-
-    if uses_nanovllm and not path.is_dir():
-        raise SystemExit(
-            "Model directory not found for nano-vLLM benchmark:\n"
-            f"  {path}\n"
-            "nano-vLLM currently requires --model to point to a local "
-            "Hugging Face model directory. In Colab, pass the repo-relative "
-            "path, for example --model models/Qwen3-0.6B/, "
-            "or run only upstream vLLM with --engines vllm and a valid model id/path."
+        candidates.extend(
+            [
+                Path.cwd() / path,
+                REPO_ROOT / path,
+                Path("/content") / path,
+            ]
         )
 
-    if not uses_nanovllm and model_arg_looks_like_path(model) and not path.is_dir():
-        raise SystemExit(
-            "Model path not found:\n"
-            f"  {path}\n"
-            "For upstream vLLM, pass either an existing local directory or a "
-            "Hugging Face model id such as Qwen/Qwen3-0.6B."
+    model_name = path.name
+    if model_name:
+        candidates.extend(
+            [
+                Path("/models") / model_name,
+                Path.cwd() / "models" / model_name,
+                REPO_ROOT / "models" / model_name,
+                Path("/content/models") / model_name,
+                Path("/content/nano-vllm/models") / model_name,
+                Path("/root/huggingface") / model_name,
+                Path.home() / "huggingface" / model_name,
+            ]
         )
+
+    return unique_paths(candidates)
+
+
+def resolve_local_model_arg(model: str) -> str:
+    for path in model_path_candidates(model):
+        if path.is_dir():
+            return str(path.resolve())
+    return os.path.expanduser(model)
+
+
+def normalize_vllm_model_arg(model: str) -> str:
+    if model_arg_looks_like_local_path(model):
+        return resolve_local_model_arg(model)
+    return model
+
+
+def engine_model(args: argparse.Namespace, engine: str) -> str:
+    if engine == "nanovllm":
+        return args.nano_model
+    if engine == "vllm":
+        return args.vllm_model
+    raise ValueError(f"Unknown engine: {engine}")
+
+
+def apply_model_overrides(args: argparse.Namespace) -> None:
+    if args.model:
+        args.nano_model = args.model
+        args.vllm_model = args.model
+    args.nano_model = resolve_local_model_arg(args.nano_model)
+    args.vllm_model = normalize_vllm_model_arg(args.vllm_model)
+
+
+def validate_model_args(args: argparse.Namespace, candidates: list[tuple[str, str]]) -> None:
+    engines = {engine for engine, _ in candidates}
+
+    if "nanovllm" in engines:
+        model = args.nano_model
+        path = Path(os.path.expanduser(model))
+        checked_paths = "\n".join(f"  - {p}" for p in model_path_candidates(model))
+
+        if not path.is_dir():
+            raise SystemExit(
+                "Model directory not found for nano-vLLM benchmark:\n"
+                f"  {path}\n"
+                "Checked:\n"
+                f"{checked_paths}\n"
+                "nano-vLLM currently requires --nano-model to point to a local "
+                "Hugging Face model directory. The Colab default is "
+                f"{DEFAULT_NANO_MODEL}."
+            )
+
+    if "vllm" in engines:
+        model = args.vllm_model
+        path = Path(os.path.expanduser(model))
+        if model_arg_looks_like_local_path(model) and not path.is_dir():
+            checked_paths = "\n".join(f"  - {p}" for p in model_path_candidates(model))
+            raise SystemExit(
+                "Model path not found for upstream vLLM benchmark:\n"
+                f"  {path}\n"
+                "Checked:\n"
+                f"{checked_paths}\n"
+                "For upstream vLLM, pass either an existing local directory via "
+                "--vllm-model or a Hugging Face model id such as "
+                f"{DEFAULT_VLLM_MODEL}."
+            )
+
+
+def workload_model_label(model: str) -> str:
+    if model_arg_looks_like_local_path(model):
+        return Path(os.path.expanduser(model)).name
+    return model.split("/")[-1]
 
 
 def get_vocab_size(model: str) -> int:
@@ -259,7 +359,7 @@ def workload_fingerprint(
     cold_prompts: list[list[int]],
 ) -> str:
     payload = {
-        "model": args.model,
+        "model": workload_model_label(args.model),
         "num_prompts": args.num_prompts,
         "prefix_len": args.prefix_len,
         "suffix_len": args.suffix_len,
@@ -525,7 +625,7 @@ def child_args(base_args: argparse.Namespace, engine: str, config: str) -> list[
         "--config-name",
         config,
         "--model",
-        base_args.model,
+        engine_model(base_args, engine),
         "--num-prompts",
         str(base_args.num_prompts),
         "--prefix-len",
@@ -648,10 +748,20 @@ def print_summary(results: list[CandidateResult]) -> None:
 
 def main() -> None:
     args = parse_args()
-    args.model = normalize_model_arg(args.model)
     if args.worker:
+        if args.model is None:
+            if args.engine == "nanovllm":
+                args.model = args.nano_model
+            elif args.engine == "vllm":
+                args.model = args.vllm_model
+        if args.engine == "nanovllm" and args.model is not None:
+            args.model = resolve_local_model_arg(args.model)
+        elif args.engine == "vllm" and args.model is not None:
+            args.model = normalize_vllm_model_arg(args.model)
         print_worker_result(run_worker(args))
         return
+
+    apply_model_overrides(args)
 
     if args.prefix_len < 256:
         print("Warning: prefix_len < 256 may reduce/disable block-level prefix cache hits in nano-vLLM.")
@@ -667,12 +777,19 @@ def main() -> None:
         raise ValueError(f"Unknown engines: {unknown}")
     if not candidates:
         raise ValueError("No benchmark candidates selected.")
-    validate_model_arg(args.model, candidates)
+    validate_model_args(args, candidates)
+
+    selected_engines = {engine for engine, _ in candidates}
+    model_lines = []
+    if "nanovllm" in selected_engines:
+        model_lines.append(f"- nano_model={args.nano_model}")
+    if "vllm" in selected_engines:
+        model_lines.append(f"- vllm_model={args.vllm_model}")
 
     print("Benchmark workload:")
     print(
-        f"- model={args.model}\n"
-        f"- num_prompts={args.num_prompts}, prefix_len={args.prefix_len}, "
+        "\n".join(model_lines)
+        + f"\n- num_prompts={args.num_prompts}, prefix_len={args.prefix_len}, "
         f"suffix_len={args.suffix_len}, max_tokens={args.max_tokens}\n"
         f"- timing=public generate() API with CUDA synchronization\n"
         f"- candidates={', '.join(f'{e}:{c}' for e, c in candidates)}"
