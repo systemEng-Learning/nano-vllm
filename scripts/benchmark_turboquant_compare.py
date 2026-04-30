@@ -23,6 +23,9 @@ from time import perf_counter
 from typing import Any
 
 RESULT_PREFIX = "RESULT_JSON:"
+DEFAULT_MODEL = "~/huggingface/Qwen3-0.6B/"
+DEFAULT_NANO_BACKENDS = "turboquant"
+DEFAULT_VLLM_KV_CACHE_DTYPES = "turboquant_4bit_nc"
 
 
 @dataclass
@@ -102,8 +105,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"),
-        help="Local HF model path or model id. nano-vLLM requires a local directory.",
+        default=os.path.expanduser(DEFAULT_MODEL),
+        help=(
+            "Local HF model path or model id. nano-vLLM requires a local "
+            f"directory. Default: {DEFAULT_MODEL}"
+        ),
     )
     parser.add_argument(
         "--engines",
@@ -114,17 +120,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nano-backends",
         type=str,
-        default="default,turboquant",
-        help="Comma-separated nano-vLLM kvcache_type values.",
+        default=DEFAULT_NANO_BACKENDS,
+        help=(
+            "Comma-separated nano-vLLM kvcache_type values. "
+            f"Default: {DEFAULT_NANO_BACKENDS}. Use default,turboquant "
+            "to include the non-quantized baseline."
+        ),
     )
     parser.add_argument(
         "--vllm-kv-cache-dtypes",
         type=str,
-        default="auto,turboquant_4bit_nc",
+        default=DEFAULT_VLLM_KV_CACHE_DTYPES,
         help=(
             "Comma-separated vLLM kv_cache_dtype values. Current vLLM TurboQuant "
             "presets include turboquant_4bit_nc, turboquant_k8v4, "
-            "turboquant_k3v4_nc, and turboquant_3bit_nc."
+            "turboquant_k3v4_nc, and turboquant_3bit_nc. "
+            f"Default: {DEFAULT_VLLM_KV_CACHE_DTYPES}. Use auto,turboquant_4bit_nc "
+            "to include the non-quantized baseline."
         ),
     )
     parser.add_argument("--num-prompts", type=int, default=8)
