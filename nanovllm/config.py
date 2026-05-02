@@ -22,7 +22,13 @@ class Config:
     kvcache_type: str = "default"
 
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        self.model = os.path.expanduser(self.model)
+        if not os.path.isdir(self.model):
+            raise FileNotFoundError(
+                f"Model directory does not exist: {self.model}. "
+                "nano-vLLM currently requires --model to point to a local "
+                "Hugging Face model directory."
+            )
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)

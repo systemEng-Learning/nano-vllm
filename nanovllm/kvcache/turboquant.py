@@ -1,4 +1,4 @@
-"""TurboQuant-style 4-bit KV cache for nano-vllm.
+"""TurboQuant-style packed KV cache for nano-vllm.
 
 Based on: turboquant-pytorch/lloyd_max.py (Zandieh et al.) and vllm
 """
@@ -11,53 +11,96 @@ import triton
 import triton.language as tl
 
 from nanovllm.kvcache.base import BaseKVCache, KVCacheRegistry
+from nanovllm.kvcache.turboquant_config import (
+    TurboQuantConfig,
+    packed_size_bytes,
+    turboquant_config_for_preset,
+)
 
 
-def _trapz(f, a: float, b: float, n: int = 200) -> float:
-    h = (b - a) / n
-    result = 0.5 * (f(a) + f(b))
-    for i in range(1, n):
-        result += f(a + i * h)
-    return result * h
+# Lloyd-Max tables for a unit-variance normal distribution. Runtime tables are
+# scaled by 1 / sqrt(head_dim), matching the normalized key component variance.
+_LLOYD_MAX_UNIT_TABLES: dict[int, tuple[tuple[float, ...], tuple[float, ...]]] = {
+    3: (
+        (
+            -2.1503495389,
+            -1.3431800019,
+            -0.7556454989,
+            -0.2449835925,
+            0.2449835925,
+            0.7556454989,
+            1.3431800019,
+            2.1503495389,
+        ),
+        (
+            -1.7467647704,
+            -1.0494127504,
+            -0.5003145457,
+            0.0,
+            0.5003145457,
+            1.0494127504,
+            1.7467647704,
+        ),
+    ),
+    4: (
+        (
+            -2.7309222188,
+            -2.0684471187,
+            -1.6178817596,
+            -1.2562575697,
+            -0.9424482433,
+            -0.6568799185,
+            -0.3881377909,
+            -0.1284276607,
+            0.1284276607,
+            0.3881377909,
+            0.6568799185,
+            0.9424482433,
+            1.2562575697,
+            1.6178817596,
+            2.0684471187,
+            2.7309222188,
+        ),
+        (
+            -2.3996846687,
+            -1.8431644391,
+            -1.4370696646,
+            -1.0993529065,
+            -0.7996640809,
+            -0.5225088547,
+            -0.2582827258,
+            0.0,
+            0.2582827258,
+            0.5225088547,
+            0.7996640809,
+            1.0993529065,
+            1.4370696646,
+            1.8431644391,
+            2.3996846687,
+        ),
+    ),
+}
 
 
-def _gaussian_pdf(x: float, sigma2: float) -> float:
-    return (1.0 / math.sqrt(2.0 * math.pi * sigma2)) * math.exp(
-        -(x * x) / (2.0 * sigma2)
+def _static_lloyd_max_centroids(head_dim: int, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if bits not in _LLOYD_MAX_UNIT_TABLES:
+        raise ValueError(f"Unsupported TurboQuant key bit-width: {bits}")
+    centroids, boundaries = _LLOYD_MAX_UNIT_TABLES[bits]
+    scale = 1.0 / math.sqrt(head_dim)
+    return (
+        torch.tensor(centroids, dtype=torch.float32) * scale,
+        torch.tensor(boundaries, dtype=torch.float32) * scale,
     )
 
 
-@lru_cache(maxsize=16)
-def _lloyd_max_centroids(head_dim: int, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
-    n_levels = 2**bits
-    sigma2 = 1.0 / head_dim
-    sigma = math.sqrt(sigma2)
-
-    def pdf(x: float) -> float:
-        return _gaussian_pdf(x, sigma2)
-
-    lo, hi = -3.5 * sigma, 3.5 * sigma
-    centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
-    for _ in range(200):
-        boundaries = [
-            (centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)
-        ]
-        edges = [lo * 3.0] + boundaries + [hi * 3.0]
-        new_centroids = []
-        for i in range(n_levels):
-            a, b = edges[i], edges[i + 1]
-            num = _trapz(lambda x: x * pdf(x), a, b)
-            den = _trapz(pdf, a, b)
-            new_centroids.append(num / den if den > 1e-15 else centroids[i])
-        if max(abs(new_centroids[i] - centroids[i]) for i in range(n_levels)) < 1e-10:
-            centroids = new_centroids
-            break
-        centroids = new_centroids
-
-    boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)]
-    return (
-        torch.tensor(centroids, dtype=torch.float32),
-        torch.tensor(boundaries, dtype=torch.float32),
+def _bits_from_centroid_count(centroid_count: int) -> int:
+    if centroid_count == 8:
+        return 3
+    if centroid_count == 16:
+        return 4
+    raise ValueError(
+        "TurboQuant key centroids must contain 8 or 16 levels, "
+        f"got {centroid_count}."
     )
 
 
@@ -75,6 +118,63 @@ def _hadamard_matrix(head_dim: int) -> torch.Tensor:
         matrix = torch.kron(matrix, base)
         dim *= 2
     return matrix / math.sqrt(head_dim)
+
+
+@triton.jit
+def _load_packed_indices(
+    cache_ptr,
+    base,
+    d_offs,
+    d_mask,
+    bits: tl.constexpr,
+    packed_bytes: tl.constexpr,
+):
+    if bits == 4:
+        byte_idx = d_offs // 2
+        bit_shift = (d_offs % 2) * 4
+        packed = tl.load(
+            cache_ptr + base + byte_idx,
+            mask=d_mask & (byte_idx < packed_bytes),
+            other=0,
+        ).to(tl.int32)
+        return ((packed >> bit_shift) & 0xF).to(tl.int32)
+
+    group_idx = d_offs // 8
+    lane = d_offs % 8
+    byte_base = group_idx * 3
+    b0 = tl.load(
+        cache_ptr + base + byte_base,
+        mask=d_mask & (byte_base < packed_bytes),
+        other=0,
+    ).to(tl.int32)
+    b1 = tl.load(
+        cache_ptr + base + byte_base + 1,
+        mask=d_mask & ((byte_base + 1) < packed_bytes),
+        other=0,
+    ).to(tl.int32)
+    b2 = tl.load(
+        cache_ptr + base + byte_base + 2,
+        mask=d_mask & ((byte_base + 2) < packed_bytes),
+        other=0,
+    ).to(tl.int32)
+
+    idx0 = b0 & 0x7
+    idx1 = (b0 >> 3) & 0x7
+    idx2 = ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2)
+    idx3 = (b1 >> 1) & 0x7
+    idx4 = (b1 >> 4) & 0x7
+    idx5 = ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1)
+    idx6 = (b2 >> 2) & 0x7
+    idx7 = (b2 >> 5) & 0x7
+
+    idx = tl.where(lane == 0, idx0, idx1)
+    idx = tl.where(lane == 2, idx2, idx)
+    idx = tl.where(lane == 3, idx3, idx)
+    idx = tl.where(lane == 4, idx4, idx)
+    idx = tl.where(lane == 5, idx5, idx)
+    idx = tl.where(lane == 6, idx6, idx)
+    idx = tl.where(lane == 7, idx7, idx)
+    return idx.to(tl.int32)
 
 
 @triton.jit
@@ -97,6 +197,8 @@ def store_kvcache_turboquant_kernel(
     boundaries_ptr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    key_bits: tl.constexpr,
+    value_bits: tl.constexpr,
     key_packed_bytes: tl.constexpr,
     value_packed_bytes: tl.constexpr,
     num_boundaries: tl.constexpr,
@@ -131,15 +233,27 @@ def store_kvcache_turboquant_kernel(
         key_indices += (rotated_key > boundary).to(tl.int32)
 
     key_cache_base = (slot * num_heads + head_idx) * key_packed_bytes
-    key_pairs = tl.reshape(key_indices, (key_packed_bytes, 2))
-    key_lo, key_hi = tl.split(key_pairs)
-    key_packed = key_lo | (key_hi << 4)
-    key_pair_offs = tl.arange(0, key_packed_bytes)
-    tl.store(k_cache_ptr + key_cache_base + key_pair_offs, key_packed.to(tl.uint8))
+    if key_bits == 4:
+        key_pairs = tl.reshape(key_indices, (head_dim // 2, 2))
+        key_lo, key_hi = tl.split(key_pairs)
+        key_packed = key_lo | (key_hi << 4)
+        key_pair_offs = tl.arange(0, head_dim // 2)
+        tl.store(k_cache_ptr + key_cache_base + key_pair_offs, key_packed.to(tl.uint8))
+    else:
+        key_groups = tl.reshape(key_indices, (head_dim // 8, 8))
+        k0, k1, k2, k3, k4, k5, k6, k7 = tl.split(key_groups)
+        key_group_offs = tl.arange(0, head_dim // 8) * 3
+        key_b0 = k0 | (k1 << 3) | ((k2 & 0x3) << 6)
+        key_b1 = ((k2 >> 2) & 0x1) | (k3 << 1) | (k4 << 4) | ((k5 & 0x1) << 7)
+        key_b2 = ((k5 >> 1) & 0x3) | (k6 << 2) | (k7 << 5)
+        tl.store(k_cache_ptr + key_cache_base + key_group_offs, key_b0.to(tl.uint8))
+        tl.store(k_cache_ptr + key_cache_base + key_group_offs + 1, key_b1.to(tl.uint8))
+        tl.store(k_cache_ptr + key_cache_base + key_group_offs + 2, key_b2.to(tl.uint8))
 
     value_min = tl.min(value, axis=0)
     value_max = tl.max(value, axis=0)
-    value_scale = (value_max - value_min) / 15.0
+    value_levels_max = (1 << value_bits) - 1
+    value_scale = (value_max - value_min) / value_levels_max
     value_scale = tl.where(value_scale > 0.0, value_scale, 1.0)
     value_scaled = (value - value_min) / value_scale
     # Triton compatibility: avoid tl.math.llrint (missing on some builds).
@@ -148,14 +262,25 @@ def store_kvcache_turboquant_kernel(
         tl.floor(value_scaled + 0.5),
         -tl.floor(-value_scaled + 0.5),
     )
-    value_indices = tl.clamp(value_rounded, 0, 15).to(tl.int32)
+    value_indices = tl.clamp(value_rounded, 0, value_levels_max).to(tl.int32)
 
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
-    value_pairs = tl.reshape(value_indices, (value_packed_bytes, 2))
-    value_lo, value_hi = tl.split(value_pairs)
-    value_packed = value_lo | (value_hi << 4)
-    value_pair_offs = tl.arange(0, value_packed_bytes)
-    tl.store(v_cache_ptr + value_cache_base + value_pair_offs, value_packed.to(tl.uint8))
+    if value_bits == 4:
+        value_pairs = tl.reshape(value_indices, (head_dim // 2, 2))
+        value_lo, value_hi = tl.split(value_pairs)
+        value_packed = value_lo | (value_hi << 4)
+        value_pair_offs = tl.arange(0, head_dim // 2)
+        tl.store(v_cache_ptr + value_cache_base + value_pair_offs, value_packed.to(tl.uint8))
+    else:
+        value_groups = tl.reshape(value_indices, (head_dim // 8, 8))
+        v0, v1, v2, v3, v4, v5, v6, v7 = tl.split(value_groups)
+        value_group_offs = tl.arange(0, head_dim // 8) * 3
+        value_b0 = v0 | (v1 << 3) | ((v2 & 0x3) << 6)
+        value_b1 = ((v2 >> 2) & 0x1) | (v3 << 1) | (v4 << 4) | ((v5 & 0x1) << 7)
+        value_b2 = ((v5 >> 1) & 0x3) | (v6 << 2) | (v7 << 5)
+        tl.store(v_cache_ptr + value_cache_base + value_group_offs, value_b0.to(tl.uint8))
+        tl.store(v_cache_ptr + value_cache_base + value_group_offs + 1, value_b1.to(tl.uint8))
+        tl.store(v_cache_ptr + value_cache_base + value_group_offs + 2, value_b2.to(tl.uint8))
 
     meta_idx = slot * num_heads + head_idx
     tl.store(k_norms_ptr + meta_idx, safe_key_norm.to(tl.float16))
@@ -189,6 +314,8 @@ def dequantize_kvcache_turboquant_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     num_heads: tl.constexpr,
+    key_bits: tl.constexpr,
+    value_bits: tl.constexpr,
     key_packed_bytes: tl.constexpr,
     value_packed_bytes: tl.constexpr,
     centroid_count: tl.constexpr,
@@ -220,27 +347,35 @@ def dequantize_kvcache_turboquant_kernel(
 
     d_offs = tl.arange(0, block_d)
     d_mask = d_offs < head_dim
-    byte_idx = d_offs // 2
-    bit_shift = (d_offs % 2) * 4
 
-    k_packed = tl.load(
-        k_cache_ptr + k_base + byte_idx,
-        mask=d_mask & (byte_idx < key_packed_bytes),
-        other=0,
-    ).to(tl.int32)
-    k_idx = ((k_packed >> bit_shift) & 0xF).to(tl.int32)
+    k_idx = _load_packed_indices(
+        k_cache_ptr,
+        k_base,
+        d_offs,
+        d_mask,
+        key_bits,
+        key_packed_bytes,
+    )
     k_idx = tl.where(d_mask, k_idx, 0)
     centroid_mask = d_mask & (k_idx < centroid_count)
-    k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
+    k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(
+        tl.float32
+    )
     k_norm = tl.load(k_norms_ptr + meta_base).to(tl.float32)
-    tl.store(k_out_ptr + out_base + d_offs, (k_vals * k_norm).to(k_out_ptr.dtype.element_ty), mask=d_mask)
+    tl.store(
+        k_out_ptr + out_base + d_offs,
+        (k_vals * k_norm).to(k_out_ptr.dtype.element_ty),
+        mask=d_mask,
+    )
 
-    v_packed = tl.load(
-        v_cache_ptr + v_base + byte_idx,
-        mask=d_mask & (byte_idx < value_packed_bytes),
-        other=0,
-    ).to(tl.int32)
-    v_idx = ((v_packed >> bit_shift) & 0xF).to(tl.float32)
+    v_idx = _load_packed_indices(
+        v_cache_ptr,
+        v_base,
+        d_offs,
+        d_mask,
+        value_bits,
+        value_packed_bytes,
+    ).to(tl.float32)
     v_scale = tl.load(v_scales_ptr + meta_base).to(tl.float32)
     v_zero = tl.load(v_zeros_ptr + meta_base).to(tl.float32)
     v_vals = v_idx * v_scale + v_zero
@@ -257,11 +392,19 @@ def dequantize_kvcache_turboquant(
     v_zeros: torch.Tensor,
     k_centroids: torch.Tensor,
     out_dtype: torch.dtype,
+    head_dim: int | None = None,
+    key_bits: int | None = None,
+    value_bits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if seq_len <= 0:
         raise ValueError("TurboQuant dequantization expects a positive sequence length.")
 
-    head_dim = k_norms.shape[-1] if k_norms.ndim > 3 else k_cache.shape[-1] * 2
+    if key_bits is None:
+        key_bits = _bits_from_centroid_count(k_centroids.numel())
+    if head_dim is None:
+        head_dim = (k_cache.shape[-1] * 8) // key_bits
+    if value_bits is None:
+        value_bits = (v_cache.shape[-1] * 8) // head_dim
     num_heads = k_cache.shape[2]
     block_size = k_cache.shape[1]
     block_d = triton.next_power_of_2(head_dim)
@@ -295,6 +438,8 @@ def dequantize_kvcache_turboquant(
         head_dim=head_dim,
         block_size=block_size,
         num_heads=num_heads,
+        key_bits=key_bits,
+        value_bits=value_bits,
         key_packed_bytes=k_cache.shape[-1],
         value_packed_bytes=v_cache.shape[-1],
         centroid_count=k_centroids.numel(),
@@ -332,6 +477,8 @@ def dequantize_kvcache_turboquant_batched_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     num_heads: tl.constexpr,
+    key_bits: tl.constexpr,
+    value_bits: tl.constexpr,
     key_packed_bytes: tl.constexpr,
     value_packed_bytes: tl.constexpr,
     centroid_count: tl.constexpr,
@@ -376,15 +523,15 @@ def dequantize_kvcache_turboquant_batched_kernel(
 
     d_offs = tl.arange(0, block_d)
     d_mask = d_offs < head_dim
-    byte_idx = d_offs // 2
-    bit_shift = (d_offs % 2) * 4
 
-    k_packed = tl.load(
-        k_cache_ptr + k_base + byte_idx,
-        mask=d_mask & (byte_idx < key_packed_bytes),
-        other=0,
-    ).to(tl.int32)
-    k_idx = ((k_packed >> bit_shift) & 0xF).to(tl.int32)
+    k_idx = _load_packed_indices(
+        k_cache_ptr,
+        k_base,
+        d_offs,
+        d_mask,
+        key_bits,
+        key_packed_bytes,
+    )
     k_idx = tl.where(d_mask, k_idx, 0)
     centroid_mask = d_mask & (k_idx < centroid_count)
     k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
@@ -395,12 +542,14 @@ def dequantize_kvcache_turboquant_batched_kernel(
         mask=d_mask,
     )
 
-    v_packed = tl.load(
-        v_cache_ptr + v_base + byte_idx,
-        mask=d_mask & (byte_idx < value_packed_bytes),
-        other=0,
-    ).to(tl.int32)
-    v_idx = ((v_packed >> bit_shift) & 0xF).to(tl.float32)
+    v_idx = _load_packed_indices(
+        v_cache_ptr,
+        v_base,
+        d_offs,
+        d_mask,
+        value_bits,
+        value_packed_bytes,
+    ).to(tl.float32)
     v_scale = tl.load(v_scales_ptr + meta_base).to(tl.float32)
     v_zero = tl.load(v_zeros_ptr + meta_base).to(tl.float32)
     v_vals = v_idx * v_scale + v_zero
@@ -420,6 +569,9 @@ def dequantize_kvcache_turboquant_batched(
     max_seq_len: int | None = None,
     out_k: torch.Tensor | None = None,
     out_v: torch.Tensor | None = None,
+    head_dim: int | None = None,
+    key_bits: int | None = None,
+    value_bits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if block_table.ndim != 2:
         raise ValueError("block_table must have shape [batch_size, max_num_blocks].")
@@ -431,7 +583,10 @@ def dequantize_kvcache_turboquant_batched(
     batch_size = block_table.shape[0]
     if batch_size == 0:
         num_heads = k_cache.shape[2]
-        head_dim = k_cache.shape[-1] * 2
+        if key_bits is None:
+            key_bits = _bits_from_centroid_count(k_centroids.numel())
+        if head_dim is None:
+            head_dim = (k_cache.shape[-1] * 8) // key_bits
         empty = torch.empty((0, 0, num_heads, head_dim), dtype=out_dtype, device=k_cache.device)
         return empty, empty
 
@@ -440,11 +595,23 @@ def dequantize_kvcache_turboquant_batched(
         max_seq_len = int(seq_lens.max().item())
     if max_seq_len <= 0:
         num_heads = k_cache.shape[2]
-        head_dim = k_cache.shape[-1] * 2
-        empty = torch.empty((batch_size, 0, num_heads, head_dim), dtype=out_dtype, device=k_cache.device)
+        if key_bits is None:
+            key_bits = _bits_from_centroid_count(k_centroids.numel())
+        if head_dim is None:
+            head_dim = (k_cache.shape[-1] * 8) // key_bits
+        empty = torch.empty(
+            (batch_size, 0, num_heads, head_dim),
+            dtype=out_dtype,
+            device=k_cache.device,
+        )
         return empty, empty
 
-    head_dim = k_norms.shape[-1] if k_norms.ndim > 3 else k_cache.shape[-1] * 2
+    if key_bits is None:
+        key_bits = _bits_from_centroid_count(k_centroids.numel())
+    if head_dim is None:
+        head_dim = (k_cache.shape[-1] * 8) // key_bits
+    if value_bits is None:
+        value_bits = (v_cache.shape[-1] * 8) // head_dim
     num_heads = k_cache.shape[2]
     block_size = k_cache.shape[1]
     block_d = triton.next_power_of_2(head_dim)
@@ -472,7 +639,9 @@ def dequantize_kvcache_turboquant_batched(
             or out_k.shape[3] != head_dim
             or out_v.shape[3] != head_dim
         ):
-            raise ValueError("Provided output buffers are incompatible with requested dequant shape.")
+            raise ValueError(
+                "Provided output buffers are incompatible with requested dequant shape."
+            )
         dense_k = out_k[:batch_size, :max_seq_len]
         dense_v = out_v[:batch_size, :max_seq_len]
 
@@ -505,6 +674,8 @@ def dequantize_kvcache_turboquant_batched(
         head_dim=head_dim,
         block_size=block_size,
         num_heads=num_heads,
+        key_bits=key_bits,
+        value_bits=value_bits,
         key_packed_bytes=k_cache.shape[-1],
         value_packed_bytes=v_cache.shape[-1],
         centroid_count=k_centroids.numel(),
@@ -516,10 +687,10 @@ def dequantize_kvcache_turboquant_batched(
 @KVCacheRegistry.register("turboquant")
 class TurboQuantKVCache(BaseKVCache):
     """
-    TurboQuant-style cache with 4-bit packed storage.
+    TurboQuant-style cache with 3/4-bit packed storage.
 
     Keys are L2-normalized, Hadamard-rotated, then Lloyd-Max quantized.
-    Values use per-vector affine 4-bit quantization.
+    Values use per-vector affine quantization.
     """
 
     def __init__(
@@ -532,6 +703,7 @@ class TurboQuantKVCache(BaseKVCache):
         device: str = "cuda",
         key_bits: int = 4,
         value_bits: int = 4,
+        turboquant_config: TurboQuantConfig | None = None,
     ):
         super().__init__(
             num_blocks=num_blocks,
@@ -541,25 +713,26 @@ class TurboQuantKVCache(BaseKVCache):
             dtype=dtype,
             device=device,
         )
-        if key_bits != 4 or value_bits != 4:
-            raise ValueError(
-                "TurboQuantKVCache currently supports only the 4-bit T4-oriented layout"
-            )
+        self.turboquant_config = turboquant_config or TurboQuantConfig(
+            preset=f"turboquant_k{key_bits}v{value_bits}",
+            key_bits=key_bits,
+            value_bits=value_bits,
+        )
+        key_bits = self.turboquant_config.key_bits
+        value_bits = self.turboquant_config.value_bits
+        if key_bits not in (3, 4) or value_bits not in (3, 4):
+            raise ValueError("TurboQuantKVCache supports only 3-bit and 4-bit K/V modes.")
         if head_dim < 1 or (head_dim & (head_dim - 1)) != 0:
             raise ValueError(
                 "TurboQuantKVCache requires a power-of-two head_dim for Hadamard rotation"
             )
-        if head_dim % 2 != 0:
-            raise ValueError(
-                "TurboQuantKVCache requires an even head_dim for 4-bit pair packing"
-            )
 
         self.key_bits = key_bits
         self.value_bits = value_bits
-        self.key_packed_bytes = math.ceil(head_dim * key_bits / 8)
-        self.value_packed_bytes = math.ceil(head_dim * value_bits / 8)
+        self.key_packed_bytes = packed_size_bytes(head_dim, key_bits)
+        self.value_packed_bytes = packed_size_bytes(head_dim, value_bits)
 
-        centroids, boundaries = _lloyd_max_centroids(head_dim, key_bits)
+        centroids, boundaries = _static_lloyd_max_centroids(head_dim, key_bits)
         rotation = _hadamard_matrix(head_dim)
         self._k_centroids = centroids.to(device=self.device)
         self._k_boundaries = boundaries.to(device=self.device)
@@ -567,7 +740,15 @@ class TurboQuantKVCache(BaseKVCache):
 
     def allocate(
         self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         cache_prefix = (self.num_blocks, self.block_size, self.num_heads)
         k_cache = torch.zeros(
             cache_prefix + (self.key_packed_bytes,),
@@ -597,7 +778,8 @@ class TurboQuantKVCache(BaseKVCache):
     ):
         if len(additional_tensors) < 5:
             raise ValueError(
-                "store() requires k_norms, v_scales, v_zeros, k_centroids, rotation in additional_tensors"
+                "store() requires k_norms, v_scales, v_zeros, k_centroids, "
+                "rotation in additional_tensors"
             )
         k_norms, v_scales, v_zeros, _k_centroids, rotation = additional_tensors[:5]
 
@@ -639,6 +821,8 @@ class TurboQuantKVCache(BaseKVCache):
             self._k_boundaries,
             self.num_heads,
             self.head_dim,
+            self.key_bits,
+            self.value_bits,
             self.key_packed_bytes,
             self.value_packed_bytes,
             self._k_boundaries.numel(),
@@ -664,3 +848,30 @@ class TurboQuantKVCache(BaseKVCache):
         )
         metadata_bytes = self.block_size * self.num_heads * 6
         return quant_bytes + metadata_bytes
+
+
+@KVCacheRegistry.register("turboquant_k4v4")
+class TurboQuantK4V4KVCache(TurboQuantKVCache):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault(
+            "turboquant_config", turboquant_config_for_preset("turboquant_k4v4")
+        )
+        super().__init__(*args, **kwargs)
+
+
+@KVCacheRegistry.register("turboquant_k3v4")
+class TurboQuantK3V4KVCache(TurboQuantKVCache):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault(
+            "turboquant_config", turboquant_config_for_preset("turboquant_k3v4")
+        )
+        super().__init__(*args, **kwargs)
+
+
+@KVCacheRegistry.register("turboquant_k3v3")
+class TurboQuantK3V3KVCache(TurboQuantKVCache):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault(
+            "turboquant_config", turboquant_config_for_preset("turboquant_k3v3")
+        )
+        super().__init__(*args, **kwargs)

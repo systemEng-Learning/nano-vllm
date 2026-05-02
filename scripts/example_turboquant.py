@@ -18,6 +18,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--kvcache-type",
+        type=str,
+        default="turboquant",
+        choices=("turboquant", "turboquant_k4v4", "turboquant_k3v4", "turboquant_k3v3"),
+        help="TurboQuant preset to run.",
+    )
     return parser.parse_args()
 
 
@@ -25,7 +32,7 @@ def main() -> None:
     args = parse_args()
     llm = LLM(
         args.model,
-        kvcache_type="turboquant",
+        kvcache_type=args.kvcache_type,
         enforce_eager=args.enforce_eager,
         tensor_parallel_size=1,
     )

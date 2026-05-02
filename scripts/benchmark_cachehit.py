@@ -52,7 +52,10 @@ def parse_args() -> argparse.Namespace:
         "--backends",
         type=str,
         default="default,turboquant",
-        help="Comma-separated kvcache backends to benchmark (e.g. default,turboquant,int8).",
+        help=(
+            "Comma-separated kvcache backends to benchmark "
+            "(e.g. default,turboquant_k4v4,turboquant_k3v4,int8)."
+        ),
     )
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument(

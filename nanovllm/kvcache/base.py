@@ -233,6 +233,16 @@ class KVCacheRegistry:
         Returns:
             KV cache instance
         """
+        try:
+            from nanovllm.kvcache.turboquant_config import resolve_turboquant_config
+        except ImportError:
+            turboquant_config = None
+        else:
+            turboquant_config = resolve_turboquant_config(name)
+        if turboquant_config is not None:
+            name = "turboquant"
+            kwargs.setdefault("turboquant_config", turboquant_config)
+
         cache_cls = cls.get_cache_class(name)
         return cache_cls(
             num_blocks=num_blocks,

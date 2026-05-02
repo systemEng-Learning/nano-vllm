@@ -146,8 +146,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_NANO_BACKENDS,
         help=(
             "Comma-separated nano-vLLM kvcache_type values. "
-            f"Default: {DEFAULT_NANO_BACKENDS}. Use default,turboquant "
-            "to include the non-quantized baseline."
+            f"Default: {DEFAULT_NANO_BACKENDS}. Use "
+            "default,turboquant_k4v4,turboquant_k3v4 to include the "
+            "non-quantized baseline and multi-bit TurboQuant presets."
         ),
     )
     parser.add_argument(
@@ -175,6 +176,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--allow-nano-turboquant-cudagraph",
+        action="store_true",
+        help=(
+            "Allow nano-vLLM TurboQuant to capture CUDA graphs. By default this "
+            "benchmark runs nano TurboQuant eagerly because its dynamic "
+            "Triton/FlashInfer path can invalidate graph capture on T4."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unsupported-vllm-turboquant",
+        action="store_true",
+        help=(
+            "Run vLLM TurboQuant even on GPUs below Ampere. By default this "
+            "benchmark skips it because vLLM TurboQuant prefill calls FA2, "
+            "which errors on T4/SM75."
+        ),
+    )
+    parser.add_argument(
+        "--strict-flashinfer-version-check",
+        action="store_true",
+        help=(
+            "Do not set FLASHINFER_DISABLE_VERSION_CHECK=1 for worker "
+            "subprocesses. By default the benchmark disables this check because "
+            "Colab images often have matching runtime behavior but mismatched "
+            "flashinfer/flashinfer-jit-cache package version strings."
+        ),
+    )
     parser.add_argument("--skip-cold", action="store_true", help="Only run seeded prefix-cache-hit phase.")
     parser.add_argument("--json-out", type=str, default=None, help="Optional path for machine-readable results.")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -392,6 +421,17 @@ def maybe_cuda_peak_memory() -> tuple[float | None, float | None]:
         return None, None
 
 
+def cuda_compute_capability() -> tuple[int, int] | None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability()
+    except Exception:
+        pass
+    return None
+
+
 def cuda_synchronize() -> None:
     try:
         import torch
@@ -400,6 +440,42 @@ def cuda_synchronize() -> None:
             torch.cuda.synchronize()
     except Exception:
         pass
+
+
+def configure_flashinfer_env(args: argparse.Namespace, env: dict[str, str] | None = None) -> dict[str, str]:
+    configured_env = os.environ.copy() if env is None else env.copy()
+    if not args.strict_flashinfer_version_check:
+        configured_env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    return configured_env
+
+
+def is_turboquant_config(config: str) -> bool:
+    return config == "turboquant" or config.startswith("turboquant_")
+
+
+def should_enforce_eager_for_candidate(args: argparse.Namespace, engine: str, config: str) -> bool:
+    if args.enforce_eager:
+        return True
+    return (
+        engine == "nanovllm"
+        and is_turboquant_config(config)
+        and not args.allow_nano_turboquant_cudagraph
+    )
+
+
+def unsupported_vllm_turboquant_reason(args: argparse.Namespace, config: str) -> str | None:
+    if args.allow_unsupported_vllm_turboquant or not is_turboquant_config(config):
+        return None
+    capability = cuda_compute_capability()
+    if capability is None:
+        return None
+    major, minor = capability
+    if major >= 8:
+        return None
+    return (
+        "vLLM TurboQuant prefill calls FlashAttention FA2, which only supports "
+        f"Ampere/SM80 or newer. Current GPU compute capability is {major}.{minor}."
+    )
 
 
 def filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -651,8 +727,14 @@ def child_args(base_args: argparse.Namespace, engine: str, config: str) -> list[
         "--tensor-parallel-size",
         str(base_args.tensor_parallel_size),
     ]
-    if base_args.enforce_eager:
+    if should_enforce_eager_for_candidate(base_args, engine, config):
         cmd.append("--enforce-eager")
+    if base_args.allow_nano_turboquant_cudagraph:
+        cmd.append("--allow-nano-turboquant-cudagraph")
+    if base_args.allow_unsupported_vllm_turboquant:
+        cmd.append("--allow-unsupported-vllm-turboquant")
+    if base_args.strict_flashinfer_version_check:
+        cmd.append("--strict-flashinfer-version-check")
     if base_args.skip_cold:
         cmd.append("--skip-cold")
     return cmd
@@ -660,8 +742,20 @@ def child_args(base_args: argparse.Namespace, engine: str, config: str) -> list[
 
 def run_candidate(args: argparse.Namespace, engine: str, config: str) -> CandidateResult:
     print(f"\n=== Running {engine}:{config} ===", flush=True)
+    if engine == "vllm":
+        unsupported_reason = unsupported_vllm_turboquant_reason(args, config)
+        if unsupported_reason:
+            print(f"Skipping {engine}:{config}: {unsupported_reason}", flush=True)
+            return CandidateResult(
+                ok=False,
+                engine=engine,
+                config=config,
+                error=f"Unsupported GPU/backend combination: {unsupported_reason}",
+            )
+
     proc = subprocess.run(
         child_args(args, engine, config),
+        env=configure_flashinfer_env(args),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -748,6 +842,7 @@ def print_summary(results: list[CandidateResult]) -> None:
 
 def main() -> None:
     args = parse_args()
+    os.environ.update(configure_flashinfer_env(args, os.environ))
     if args.worker:
         if args.model is None:
             if args.engine == "nanovllm":
@@ -785,6 +880,17 @@ def main() -> None:
         model_lines.append(f"- nano_model={args.nano_model}")
     if "vllm" in selected_engines:
         model_lines.append(f"- vllm_model={args.vllm_model}")
+    nano_auto_eager = any(
+        should_enforce_eager_for_candidate(args, engine, config)
+        and not args.enforce_eager
+        for engine, config in candidates
+    )
+    vllm_skip_reasons = [
+        unsupported_vllm_turboquant_reason(args, config)
+        for engine, config in candidates
+        if engine == "vllm"
+    ]
+    vllm_skip_reasons = [reason for reason in vllm_skip_reasons if reason]
 
     print("Benchmark workload:")
     print(
@@ -792,8 +898,13 @@ def main() -> None:
         + f"\n- num_prompts={args.num_prompts}, prefix_len={args.prefix_len}, "
         f"suffix_len={args.suffix_len}, max_tokens={args.max_tokens}\n"
         f"- timing=public generate() API with CUDA synchronization\n"
+        f"- nano_turboquant_cudagraph={'disabled' if nano_auto_eager else 'default'}\n"
+        f"- vllm_turboquant_gpu_check={'will_skip' if vllm_skip_reasons else 'ok'}\n"
+        f"- flashinfer_version_check={'strict' if args.strict_flashinfer_version_check else 'disabled'}\n"
         f"- candidates={', '.join(f'{e}:{c}' for e, c in candidates)}"
     )
+    for reason in vllm_skip_reasons:
+        print(f"Warning: {reason}", flush=True)
 
     results = [run_candidate(args, engine, config) for engine, config in candidates]
     print_summary(results)

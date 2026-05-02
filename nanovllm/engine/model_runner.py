@@ -9,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import ModelRegistry
 from nanovllm.kvcache import KVCacheRegistry
+from nanovllm.kvcache.turboquant_config import resolve_turboquant_config
 from nanovllm.layers.flash_attn_backend import (
     FlashAttentionRegistry,
     ensure_builtin_backends_registered,
@@ -73,9 +74,17 @@ class ModelRunner:
         self.model = ModelRegistry.create_model(hf_config, config.model_architecture)
         load_model(self.model, config.model)
         
-        # Create KV cache backend
-        self.cache_backend_class = KVCacheRegistry.get_cache_class(config.kvcache_type)
-        self.attn_backend = self.create_attn_backend(config.kvcache_type)
+        # Create KV cache backend. TurboQuant exposes several presets that share
+        # one cache/backend implementation.
+        self.turboquant_config = resolve_turboquant_config(config.kvcache_type)
+        cache_backend_name = "turboquant" if self.turboquant_config is not None else config.kvcache_type
+        self.cache_backend_class = KVCacheRegistry.get_cache_class(cache_backend_name)
+        self.cache_backend_kwargs = (
+            {"turboquant_config": self.turboquant_config}
+            if self.turboquant_config is not None
+            else {}
+        )
+        self.attn_backend = self.create_attn_backend(cache_backend_name)
         
         self.sampler = Sampler()
         self.warmup_model()
@@ -115,9 +124,13 @@ class ModelRunner:
     def create_attn_backend(self, backend_name: str):
         ensure_builtin_backends_registered()
         try:
-            return FlashAttentionRegistry.get(backend_name)()
+            backend_cls = FlashAttentionRegistry.get(backend_name)
         except KeyError:
-            return FlashAttentionRegistry.get("default")()
+            backend_name = "default"
+            backend_cls = FlashAttentionRegistry.get("default")
+        if backend_name == "turboquant":
+            return backend_cls(self.turboquant_config)
+        return backend_cls()
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
@@ -168,6 +181,7 @@ class ModelRunner:
             num_heads=num_kv_heads,
             head_dim=head_dim,
             dtype=self.model_dtype,
+            **self.cache_backend_kwargs,
         )
         block_bytes = temp_cache.get_cache_block_size_bytes()
         
@@ -193,6 +207,7 @@ class ModelRunner:
                     num_heads=num_kv_heads,
                     head_dim=head_dim,
                     dtype=self.model_dtype,
+                    **self.cache_backend_kwargs,
                 )
                 
                 # Let cache backend allocate its tensors

@@ -15,8 +15,14 @@ import triton
 import triton.language as tl
 
 from nanovllm.kvcache.turboquant import (
+    _bits_from_centroid_count,
+    _load_packed_indices,
     dequantize_kvcache_turboquant,
     dequantize_kvcache_turboquant_batched,
+)
+from nanovllm.kvcache.turboquant_config import (
+    TurboQuantConfig,
+    turboquant_config_for_preset,
 )
 from nanovllm.layers.flash_attn_backend import (
     BaseFlashAttentionBackend,
@@ -24,9 +30,6 @@ from nanovllm.layers.flash_attn_backend import (
 )
 from nanovllm.layers.attn_utils import normalize_decode_query
 from nanovllm.layers.flashinfer_flash_attn import FlashInferAttention
-
-
-_CONTINUATION_DECODE_THRESHOLD = 256
 
 
 @triton.jit
@@ -69,8 +72,17 @@ def _continuation_decode_attention_kernel(
         kv_idx = start_n + tl.arange(0, block_k)
         kv_mask = kv_idx < visible_len
 
-        k_ptrs = k_ptr + kv_idx[:, None] * k_stride_token + kv_head * k_stride_head + d_offs[None, :]
-        k = tl.load(k_ptrs, mask=kv_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+        k_ptrs = (
+            k_ptr
+            + kv_idx[:, None] * k_stride_token
+            + kv_head * k_stride_head
+            + d_offs[None, :]
+        )
+        k = tl.load(
+            k_ptrs,
+            mask=kv_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
         scores = tl.sum(q[None, :] * k, axis=1) * softmax_scale
         scores = tl.where(kv_mask, scores, -float("inf"))
 
@@ -79,8 +91,17 @@ def _continuation_decode_attention_kernel(
         alpha = tl.exp(m_prev - m_next)
         probs = tl.exp(scores - m_next)
 
-        v_ptrs = v_ptr + kv_idx[:, None] * v_stride_token + kv_head * v_stride_head + d_offs[None, :]
-        v = tl.load(v_ptrs, mask=kv_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+        v_ptrs = (
+            v_ptr
+            + kv_idx[:, None] * v_stride_token
+            + kv_head * v_stride_head
+            + d_offs[None, :]
+        )
+        v = tl.load(
+            v_ptrs,
+            mask=kv_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
 
         acc = acc * alpha + tl.sum(probs[:, None] * v, axis=0)
         l_prev = l_prev * alpha + tl.sum(probs, axis=0)
@@ -122,6 +143,8 @@ def _packed_continuation_decode_attention_kernel(
     softmax_scale,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    key_bits: tl.constexpr,
+    value_bits: tl.constexpr,
     key_packed_bytes: tl.constexpr,
     value_packed_bytes: tl.constexpr,
     centroid_count: tl.constexpr,
@@ -138,9 +161,6 @@ def _packed_continuation_decode_attention_kernel(
     q_base = token_idx * q_stride_token + head_idx * q_stride_head
     q = tl.load(q_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
 
-    byte_idx = d_offs // 2
-    bit_shift = (d_offs % 2) * 4
-
     m_prev = -float("inf")
     l_prev = 0.0
     acc = tl.zeros([block_d], dtype=tl.float32)
@@ -151,7 +171,11 @@ def _packed_continuation_decode_attention_kernel(
 
         page_idx = kv_idx // block_size
         page_off = kv_idx % block_size
-        block_num = tl.load(block_table_ptr + page_idx * block_table_stride, mask=kv_mask, other=0).to(tl.int64)
+        block_num = tl.load(
+            block_table_ptr + page_idx * block_table_stride,
+            mask=kv_mask,
+            other=0,
+        ).to(tl.int64)
 
         k_base = (
             block_num * k_cache_stride_block
@@ -164,12 +188,14 @@ def _packed_continuation_decode_attention_kernel(
             + tl.cast(kv_head, tl.int64) * meta_stride_head
         )
 
-        k_packed = tl.load(
-            k_cache_ptr + k_base[:, None] + byte_idx[None, :],
-            mask=kv_mask[:, None] & d_mask[None, :] & (byte_idx[None, :] < key_packed_bytes),
-            other=0,
-        ).to(tl.int32)
-        k_idx = ((k_packed >> bit_shift[None, :]) & 0xF).to(tl.int32)
+        k_idx = _load_packed_indices(
+            k_cache_ptr,
+            k_base[:, None],
+            d_offs[None, :],
+            kv_mask[:, None] & d_mask[None, :],
+            key_bits,
+            key_packed_bytes,
+        )
         k_idx = tl.where(d_mask[None, :], k_idx, 0)
         centroid_mask = kv_mask[:, None] & d_mask[None, :] & (k_idx < centroid_count)
         k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
@@ -189,12 +215,14 @@ def _packed_continuation_decode_attention_kernel(
             + page_off.to(tl.int64) * v_cache_stride_pos
             + tl.cast(kv_head, tl.int64) * v_cache_stride_head
         )
-        v_packed = tl.load(
-            v_cache_ptr + v_base[:, None] + byte_idx[None, :],
-            mask=kv_mask[:, None] & d_mask[None, :] & (byte_idx[None, :] < value_packed_bytes),
-            other=0,
-        ).to(tl.int32)
-        v_idx = ((v_packed >> bit_shift[None, :]) & 0xF).to(tl.float32)
+        v_idx = _load_packed_indices(
+            v_cache_ptr,
+            v_base[:, None],
+            d_offs[None, :],
+            kv_mask[:, None] & d_mask[None, :],
+            value_bits,
+            value_packed_bytes,
+        ).to(tl.float32)
         v_scale = tl.load(v_scales_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
         v_zero = tl.load(v_zeros_ptr + meta_base, mask=kv_mask, other=0.0).to(tl.float32)
         v = v_idx * v_scale[:, None] + v_zero[:, None]
@@ -208,13 +236,146 @@ def _packed_continuation_decode_attention_kernel(
     tl.store(out_ptr + out_base + d_offs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
 
 
+@triton.jit
+def _packed_decode_attention_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_norms_ptr,
+    v_scales_ptr,
+    v_zeros_ptr,
+    k_centroids_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    q_stride_batch,
+    q_stride_head,
+    k_cache_stride_block,
+    k_cache_stride_pos,
+    k_cache_stride_head,
+    v_cache_stride_block,
+    v_cache_stride_pos,
+    v_cache_stride_head,
+    meta_stride_block,
+    meta_stride_pos,
+    meta_stride_head,
+    block_table_stride_batch,
+    block_table_stride_block,
+    out_stride_batch,
+    out_stride_head,
+    max_seq_len,
+    kv_group_size,
+    softmax_scale,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    key_bits: tl.constexpr,
+    value_bits: tl.constexpr,
+    key_packed_bytes: tl.constexpr,
+    value_packed_bytes: tl.constexpr,
+    centroid_count: tl.constexpr,
+    block_d: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head = head_idx // kv_group_size
+    seq_len = tl.load(seq_lens_ptr + batch_idx).to(tl.int32)
+
+    d_offs = tl.arange(0, block_d)
+    d_mask = d_offs < head_dim
+    q_base = batch_idx * q_stride_batch + head_idx * q_stride_head
+    q = tl.load(q_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+
+    m_prev = -float("inf")
+    l_prev = 0.0
+    acc = tl.zeros([block_d], dtype=tl.float32)
+
+    for start_n in tl.range(0, max_seq_len, block_k):
+        kv_idx = start_n + tl.arange(0, block_k)
+        kv_mask = kv_idx < seq_len
+
+        page_idx = kv_idx // block_size
+        page_off = kv_idx % block_size
+        block_num = tl.load(
+            block_table_ptr
+            + batch_idx * block_table_stride_batch
+            + page_idx * block_table_stride_block,
+            mask=kv_mask,
+            other=0,
+        ).to(tl.int64)
+
+        k_base = (
+            block_num * k_cache_stride_block
+            + page_off.to(tl.int64) * k_cache_stride_pos
+            + tl.cast(kv_head, tl.int64) * k_cache_stride_head
+        )
+        meta_base = (
+            block_num * meta_stride_block
+            + page_off.to(tl.int64) * meta_stride_pos
+            + tl.cast(kv_head, tl.int64) * meta_stride_head
+        )
+
+        k_idx = _load_packed_indices(
+            k_cache_ptr,
+            k_base[:, None],
+            d_offs[None, :],
+            kv_mask[:, None] & d_mask[None, :],
+            key_bits,
+            key_packed_bytes,
+        )
+        k_idx = tl.where(d_mask[None, :], k_idx, 0)
+        centroid_mask = kv_mask[:, None] & d_mask[None, :] & (k_idx < centroid_count)
+        k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
+        k_norm = tl.load(k_norms_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
+        k = k_vals * k_norm[:, None]
+
+        scores = tl.sum(q[None, :] * k, axis=1) * softmax_scale
+        scores = tl.where(kv_mask, scores, -float("inf"))
+
+        m_curr = tl.max(scores, axis=0)
+        m_next = tl.maximum(m_prev, m_curr)
+        alpha = tl.exp(m_prev - m_next)
+        probs = tl.exp(scores - m_next)
+
+        v_base = (
+            block_num * v_cache_stride_block
+            + page_off.to(tl.int64) * v_cache_stride_pos
+            + tl.cast(kv_head, tl.int64) * v_cache_stride_head
+        )
+        v_idx = _load_packed_indices(
+            v_cache_ptr,
+            v_base[:, None],
+            d_offs[None, :],
+            kv_mask[:, None] & d_mask[None, :],
+            value_bits,
+            value_packed_bytes,
+        ).to(tl.float32)
+        v_scale = tl.load(v_scales_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
+        v_zero = tl.load(v_zeros_ptr + meta_base, mask=kv_mask, other=0.0).to(tl.float32)
+        v = v_idx * v_scale[:, None] + v_zero[:, None]
+
+        acc = acc * alpha + tl.sum(probs[:, None] * v, axis=0)
+        l_prev = l_prev * alpha + tl.sum(probs, axis=0)
+        m_prev = m_next
+
+    out = acc / l_prev
+    out_base = batch_idx * out_stride_batch + head_idx * out_stride_head
+    tl.store(out_ptr + out_base + d_offs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
+
+
 @FlashAttentionRegistry.register("turboquant")
 class TurboQuantFlashAttention(BaseFlashAttentionBackend):
     """Attention backend for packed TurboQuant KV cache."""
 
-    def __init__(self):
+    def __init__(self, turboquant_config: TurboQuantConfig | None = None):
+        self.turboquant_config = turboquant_config or turboquant_config_for_preset(
+            "turboquant"
+        )
         self._dense_prefill = FlashInferAttention()
-        self._decode_workspace: dict[tuple[int, torch.dtype, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._decode_workspace: dict[
+            tuple[int, torch.dtype, int, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         self._prefill_arange_cache: dict[tuple[int, torch.dtype], torch.Tensor] = {}
         self._prefill_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
@@ -248,6 +409,9 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         v_zeros: torch.Tensor,
         k_centroids: torch.Tensor,
         out_dtype: torch.dtype,
+        head_dim: int | None = None,
+        key_bits: int | None = None,
+        value_bits: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         dense_k_rot, dense_v = dequantize_kvcache_turboquant(
             k_cache,
@@ -259,6 +423,9 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             v_zeros,
             k_centroids,
             out_dtype,
+            head_dim=head_dim,
+            key_bits=key_bits,
+            value_bits=value_bits,
         )
         return dense_k_rot, dense_v
 
@@ -339,6 +506,67 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         )
         return out.squeeze(0).squeeze(1)
 
+    def _run_packed_decode_attention(
+        self,
+        q_rot: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_norms: torch.Tensor,
+        v_scales: torch.Tensor,
+        v_zeros: torch.Tensor,
+        k_centroids: torch.Tensor,
+        max_seq_len: int,
+        scale: float,
+        key_bits: int,
+        value_bits: int,
+    ) -> torch.Tensor:
+        output = torch.empty_like(q_rot)
+        block_d = triton.next_power_of_2(q_rot.shape[-1])
+        block_k = 32
+        kv_group_size = q_rot.shape[1] // k_cache.shape[2]
+        _packed_decode_attention_kernel[(q_rot.shape[0], q_rot.shape[1])](
+            q_rot,
+            k_cache,
+            v_cache,
+            k_norms,
+            v_scales,
+            v_zeros,
+            k_centroids,
+            block_table,
+            seq_lens,
+            output,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            k_norms.stride(0),
+            k_norms.stride(1),
+            k_norms.stride(2),
+            block_table.stride(0),
+            block_table.stride(1),
+            output.stride(0),
+            output.stride(1),
+            max_seq_len,
+            kv_group_size,
+            scale,
+            head_dim=q_rot.shape[-1],
+            block_size=k_cache.shape[1],
+            key_bits=key_bits,
+            value_bits=value_bits,
+            key_packed_bytes=k_cache.shape[-1],
+            value_packed_bytes=v_cache.shape[-1],
+            centroid_count=k_centroids.numel(),
+            block_d=block_d,
+            block_k=block_k,
+        )
+        return output
+
     def _run_prefill_attention(
         self,
         q_rot: torch.Tensor,
@@ -386,6 +614,8 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         cached_len: int,
         seq_len: int,
         scale: float,
+        key_bits: int,
+        value_bits: int,
     ) -> torch.Tensor:
         output = torch.empty_like(q_rot)
         block_d = triton.next_power_of_2(q_rot.shape[-1])
@@ -421,6 +651,8 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             scale,
             head_dim=q_rot.shape[-1],
             block_size=k_cache.shape[1],
+            key_bits=key_bits,
+            value_bits=value_bits,
             key_packed_bytes=k_cache.shape[-1],
             value_packed_bytes=v_cache.shape[-1],
             centroid_count=k_centroids.numel(),
@@ -479,6 +711,9 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         k_norms, v_scales, v_zeros, k_centroids, rotation = self._validate_quant_tensors(
             additional_cache_tensors
         )
+        key_bits = _bits_from_centroid_count(k_centroids.numel())
+        head_dim = rotation.shape[-1]
+        value_bits = (v_cache.shape[-1] * 8) // head_dim
         output = torch.empty_like(q)
         q_starts = cu_seqlens_q.to(torch.int64).tolist()
         k_starts = cu_seqlens_k.to(torch.int64).tolist()
@@ -504,7 +739,7 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             cached_len = seq_len - q_len
             q_req = q[q_start:q_end]
             q_req_rot = self._rotate_query_for_turboquant(q_req, rotation)
-            if 0 < cached_len and q_len <= _CONTINUATION_DECODE_THRESHOLD:
+            if 0 < cached_len and q_len <= self.turboquant_config.small_prefill_threshold:
                 output[q_start:q_end] = self._run_small_continuation_prefill_packed(
                     q_req_rot,
                     k_cache,
@@ -517,6 +752,8 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
                     cached_len,
                     seq_len,
                     scale,
+                    key_bits,
+                    value_bits,
                 )
             else:
                 dense_k_rot, dense_v = self._dequantize_sequence(
@@ -529,8 +766,11 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
                     v_zeros,
                     k_centroids,
                     q.dtype,
+                    head_dim=head_dim,
+                    key_bits=key_bits,
+                    value_bits=value_bits,
                 )
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                if q_len <= self.turboquant_config.small_prefill_threshold:
                     output[q_start:q_end] = self._run_small_continuation_prefill(
                         q_req_rot,
                         dense_k_rot,
@@ -618,12 +858,39 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             return q.unsqueeze(1)
 
         seq_lens = cache_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
-        max_seq_len = int(seq_lens.max().item())
+        # During CUDA graph capture the warmup tensors can have zero lengths; use
+        # the static block-table capacity so replay still runs the real decode path.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            max_seq_len = block_table.shape[1] * k_cache.shape[1]
+        else:
+            max_seq_len = int(seq_lens.max().item())
         if max_seq_len <= 0:
             return torch.zeros_like(q).unsqueeze(1)
 
         num_kv_heads = k_cache.shape[2]
         head_dim = q.shape[-1]
+        key_bits = _bits_from_centroid_count(k_centroids.numel())
+        value_bits = (v_cache.shape[-1] * 8) // head_dim
+        q_rot = self._rotate_query_for_turboquant(q, rotation)
+
+        if not self.turboquant_config.dense_decode_fallback:
+            out = self._run_packed_decode_attention(
+                q_rot,
+                k_cache,
+                v_cache,
+                block_table.to(device=q.device, dtype=torch.int32).contiguous(),
+                seq_lens,
+                k_norms,
+                v_scales,
+                v_zeros,
+                k_centroids,
+                max_seq_len,
+                scale,
+                key_bits,
+                value_bits,
+            )
+            return out.unsqueeze(1)
+
         k_buf, v_buf = self._get_decode_workspace(
             batch_size,
             max_seq_len,
@@ -645,8 +912,10 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             max_seq_len=max_seq_len,
             out_k=k_buf,
             out_v=v_buf,
+            head_dim=head_dim,
+            key_bits=key_bits,
+            value_bits=value_bits,
         )
-        q_rot = self._rotate_query_for_turboquant(q, rotation)
 
         # Decode query length is always 1. We mask KV positions > seq_len for each request.
         q_t = q_rot.unsqueeze(2)
@@ -665,3 +934,27 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             enable_gqa=(num_kv_heads < q.shape[1]),
         )
         return out.squeeze(2).unsqueeze(1)
+
+
+@FlashAttentionRegistry.register("turboquant_k4v4")
+class TurboQuantK4V4FlashAttention(TurboQuantFlashAttention):
+    def __init__(self, turboquant_config: TurboQuantConfig | None = None):
+        super().__init__(
+            turboquant_config or turboquant_config_for_preset("turboquant_k4v4")
+        )
+
+
+@FlashAttentionRegistry.register("turboquant_k3v4")
+class TurboQuantK3V4FlashAttention(TurboQuantFlashAttention):
+    def __init__(self, turboquant_config: TurboQuantConfig | None = None):
+        super().__init__(
+            turboquant_config or turboquant_config_for_preset("turboquant_k3v4")
+        )
+
+
+@FlashAttentionRegistry.register("turboquant_k3v3")
+class TurboQuantK3V3FlashAttention(TurboQuantFlashAttention):
+    def __init__(self, turboquant_config: TurboQuantConfig | None = None):
+        super().__init__(
+            turboquant_config or turboquant_config_for_preset("turboquant_k3v3")
+        )
