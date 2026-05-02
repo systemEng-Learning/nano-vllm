@@ -47,7 +47,12 @@ def _build_page_metadata(
     )
     paged_kv_indptr[1:] = torch.cumsum(num_pages, dim=0)
 
-    if int(num_pages.sum().item()) > 0:
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        # CUDA graph capture cannot do host syncs or create value-dependent
+        # shapes. Use the fixed block-table capacity; FlashInfer reads the
+        # active prefix from paged_kv_indptr.
+        paged_kv_indices = block_table.to(torch.int32).contiguous().reshape(-1)
+    elif int(num_pages.sum().item()) > 0:
         max_pages = block_table.shape[1]
         page_positions = torch.arange(
             max_pages,
@@ -55,7 +60,9 @@ def _build_page_metadata(
             device=block_table.device,
         ).unsqueeze(0)
         page_mask = page_positions < num_pages.unsqueeze(1)
-        paged_kv_indices = block_table.to(torch.int32).masked_select(page_mask).contiguous()
+        paged_kv_indices = (
+            block_table.to(torch.int32).masked_select(page_mask).contiguous()
+        )
     else:
         paged_kv_indices = torch.empty(0, dtype=torch.int32, device=block_table.device)
 
