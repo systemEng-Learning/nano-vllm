@@ -1,4 +1,5 @@
 import pickle
+import os
 import warnings
 import torch
 import torch.distributed as dist
@@ -20,6 +21,22 @@ from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
+
+    @staticmethod
+    def _cudagraph_batch_sizes(max_num_seqs: int) -> list[int]:
+        raw_limit = os.environ.get("NANOVLLM_CUDAGRAPH_MAX_BS", "8")
+        try:
+            graph_limit = int(raw_limit)
+        except ValueError:
+            graph_limit = 8
+        graph_limit = max(1, min(max_num_seqs, graph_limit))
+        sizes = []
+        size = 1
+        while size < graph_limit:
+            sizes.append(size)
+            size *= 2
+        sizes.append(graph_limit)
+        return sorted(set(sizes))
 
     @staticmethod
     def _normalize_torch_dtype(raw_dtype) -> torch.dtype:
@@ -301,7 +318,12 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if (
+            is_prefill
+            or self.enforce_eager
+            or not hasattr(self, "graphs")
+            or input_ids.size(0) > self.graph_bs[-1]
+        ):
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -340,7 +362,8 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        self.graph_bs = self._cudagraph_batch_sizes(self.config.max_num_seqs)
+        max_bs = self.graph_bs[-1]
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -348,7 +371,6 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
