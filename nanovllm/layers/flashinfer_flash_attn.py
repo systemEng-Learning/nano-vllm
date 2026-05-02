@@ -83,6 +83,29 @@ class FlashInferAttention(BaseFlashAttentionBackend):
         self._ragged_prefill_wrappers: dict[tuple[int, torch.device], object] = {}
         self._paged_prefill_wrappers: dict[tuple[int, torch.device], object] = {}
         self._decode_wrappers: dict[tuple[int, torch.device, bool], object] = {}
+        self._decode_graph_wrappers: dict[
+            tuple[int, torch.device, bool, int, int],
+            object,
+        ] = {}
+        self._decode_graph_buffers: dict[
+            tuple[int, torch.device, bool, int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._decode_graph_params: dict[int, tuple] = {}
+        self._capture_batch_size: int | None = None
+        self._capture_max_num_blocks: int | None = None
+
+    @property
+    def supports_cudagraph_capture(self) -> bool:
+        return True
+
+    def begin_cudagraph_capture(self, batch_size: int, max_num_blocks: int) -> None:
+        self._capture_batch_size = batch_size
+        self._capture_max_num_blocks = max_num_blocks
+
+    def end_cudagraph_capture(self) -> None:
+        self._capture_batch_size = None
+        self._capture_max_num_blocks = None
 
     def _get_workspace(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (device, dtype)
@@ -145,6 +168,127 @@ class FlashInferAttention(BaseFlashAttentionBackend):
             )
             self._decode_wrappers[key] = wrapper
         return wrapper
+
+    def _get_decode_graph_wrapper(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        use_tensor_cores: bool,
+        batch_size: int,
+        max_num_blocks: int,
+    ):
+        key = (device.index or 0, device, use_tensor_cores, batch_size, max_num_blocks)
+        wrapper = self._decode_graph_wrappers.get(key)
+        if wrapper is None:
+            flashinfer = _load_flashinfer()
+            paged_kv_indptr = torch.empty(
+                batch_size + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+            paged_kv_indices = torch.empty(
+                batch_size * max_num_blocks,
+                dtype=torch.int32,
+                device=device,
+            )
+            paged_kv_last_page_len = torch.empty(
+                batch_size,
+                dtype=torch.int32,
+                device=device,
+            )
+            wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+                self._get_workspace(device, dtype),
+                "NHD",
+                use_cuda_graph=True,
+                use_tensor_cores=use_tensor_cores,
+                paged_kv_indptr_buffer=paged_kv_indptr,
+                paged_kv_indices_buffer=paged_kv_indices,
+                paged_kv_last_page_len_buffer=paged_kv_last_page_len,
+            )
+            self._decode_graph_wrappers[key] = wrapper
+            self._decode_graph_buffers[key] = (
+                paged_kv_indptr,
+                paged_kv_indices,
+                paged_kv_last_page_len,
+            )
+        return wrapper
+
+    def _plan_decode_wrapper(
+        self,
+        wrapper,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        page_size: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        scale: float,
+        disable_split_kv: bool = False,
+    ) -> None:
+        seq_lens, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = (
+            _build_page_metadata(block_table, cache_seqlens, page_size)
+        )
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=q_dtype,
+            data_type=kv_dtype,
+            sm_scale=scale,
+            block_tables=block_table.to(torch.int32).contiguous(),
+            seq_lens=seq_lens,
+            disable_split_kv=disable_split_kv,
+        )
+
+    def prepare_cudagraph_replay(
+        self,
+        batch_size: int,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> None:
+        params = self._decode_graph_params.get(batch_size)
+        if params is None:
+            raise RuntimeError(
+                f"FlashInfer CUDA graph metadata was not captured for batch {batch_size}."
+            )
+        (
+            device,
+            dtype,
+            use_tensor_cores,
+            max_num_blocks,
+            page_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            kv_dtype,
+            scale,
+        ) = params
+        wrapper = self._get_decode_graph_wrapper(
+            device,
+            dtype,
+            use_tensor_cores,
+            batch_size,
+            max_num_blocks,
+        )
+        self._plan_decode_wrapper(
+            wrapper,
+            block_table[:batch_size],
+            cache_seqlens[:batch_size],
+            page_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            kv_dtype,
+            scale,
+            disable_split_kv=True,
+        )
 
     def prefill(
         self,
@@ -256,26 +400,59 @@ class FlashInferAttention(BaseFlashAttentionBackend):
         _validate_flashinfer_cache_dtype(k_cache, v_cache)
         q = normalize_decode_query(q)
         page_size = k_cache.shape[1]
-        seq_lens, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = (
-            _build_page_metadata(block_table, cache_seqlens, page_size)
-        )
         batch_size = q.shape[0]
         use_tensor_cores = q.shape[1] != k_cache.shape[2]
-        wrapper = self._get_decode_wrapper(q.device, q.dtype, use_tensor_cores)
-        wrapper.plan(
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            q.shape[1],
-            k_cache.shape[2],
-            q.shape[2],
-            page_size,
-            q_data_type=q.dtype,
-            data_type=k_cache.dtype,
-            sm_scale=scale,
-            block_tables=block_table.to(torch.int32).contiguous(),
-            seq_lens=seq_lens,
-        )
+        use_graph_wrapper = self._capture_batch_size == batch_size
+        if use_graph_wrapper:
+            if self._capture_max_num_blocks is None:
+                raise RuntimeError("FlashInfer CUDA graph capture was not initialized.")
+            wrapper = self._get_decode_graph_wrapper(
+                q.device,
+                q.dtype,
+                use_tensor_cores,
+                batch_size,
+                self._capture_max_num_blocks,
+            )
+            self._decode_graph_params[batch_size] = (
+                q.device,
+                q.dtype,
+                use_tensor_cores,
+                self._capture_max_num_blocks,
+                page_size,
+                q.shape[1],
+                k_cache.shape[2],
+                q.shape[2],
+                k_cache.dtype,
+                scale,
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                self._plan_decode_wrapper(
+                    wrapper,
+                    block_table,
+                    cache_seqlens,
+                    page_size,
+                    q.shape[1],
+                    k_cache.shape[2],
+                    q.shape[2],
+                    q.dtype,
+                    k_cache.dtype,
+                    scale,
+                    disable_split_kv=True,
+                )
+        else:
+            wrapper = self._get_decode_wrapper(q.device, q.dtype, use_tensor_cores)
+            self._plan_decode_wrapper(
+                wrapper,
+                block_table,
+                cache_seqlens,
+                page_size,
+                q.shape[1],
+                k_cache.shape[2],
+                q.shape[2],
+                q.dtype,
+                k_cache.dtype,
+                scale,
+            )
         out = wrapper.run(q, (k_cache, v_cache))
         if out.shape[0] != batch_size:
             raise RuntimeError(

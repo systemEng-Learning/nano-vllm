@@ -97,6 +97,28 @@ class BaseFlashAttentionBackend(ABC):
         """Whether the backend consumes packed KV cache tensors directly."""
         return False
 
+    @property
+    def supports_cudagraph_capture(self) -> bool:
+        """Whether decode can be safely captured inside a CUDA graph."""
+        return True
+
+    def begin_cudagraph_capture(self, batch_size: int, max_num_blocks: int) -> None:
+        """Prepare backend state for capturing a fixed decode batch size."""
+        return None
+
+    def end_cudagraph_capture(self) -> None:
+        """Clear any temporary capture-only backend state."""
+        return None
+
+    def prepare_cudagraph_replay(
+        self,
+        batch_size: int,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Update backend metadata buffers before replaying a captured decode graph."""
+        return None
+
 
 class FlashAttentionRegistry:
     """

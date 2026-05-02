@@ -85,6 +85,12 @@ class ModelRunner:
             else {}
         )
         self.attn_backend = self.create_attn_backend(cache_backend_name)
+        if not self.enforce_eager and not self.attn_backend.supports_cudagraph_capture:
+            warnings.warn(
+                f"{self.attn_backend.name} does not support CUDA graph capture in "
+                "this integration. Falling back to eager decode."
+            )
+            self.enforce_eager = True
         
         self.sampler = Sampler()
         self.warmup_model()
@@ -300,7 +306,8 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_bs = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[graph_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -308,7 +315,16 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph_vars["block_tables"].zero_()
+            graph_vars["block_tables"][
+                :bs,
+                :context.block_tables.size(1),
+            ] = context.block_tables
+            self.attn_backend.prepare_cudagraph_replay(
+                graph_bs,
+                graph_vars["context_lens"][:graph_bs],
+                graph_vars["block_tables"][:graph_bs],
+            )
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -338,10 +354,22 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            context_lens.zero_()
+            context_lens[:bs].fill_(1)
+            block_tables.zero_()
+            self.attn_backend.begin_cudagraph_capture(bs, max_num_blocks)
+            set_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
+            try:
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            finally:
+                self.attn_backend.end_cudagraph_capture()
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
